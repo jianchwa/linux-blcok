@@ -581,7 +581,7 @@ static void hctx_lock(struct blk_mq_hw_ctx *hctx, int *srcu_idx)
 		*srcu_idx = srcu_read_lock(hctx->srcu);
 }
 
-static void blk_mq_rq_update_aborted_gstate(struct request *rq, u64 gstate)
+void blk_mq_rq_update_aborted_gstate(struct request *rq, u64 gstate)
 {
 	unsigned long flags;
 
@@ -597,6 +597,7 @@ static void blk_mq_rq_update_aborted_gstate(struct request *rq, u64 gstate)
 	u64_stats_update_end(&rq->aborted_gstate_sync);
 	local_irq_restore(flags);
 }
+EXPORT_SYMBOL(blk_mq_rq_update_aborted_gstate);
 
 static u64 blk_mq_rq_aborted_gstate(struct request *rq)
 {
