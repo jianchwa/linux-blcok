@@ -70,6 +70,8 @@ struct nvme_queue;
 
 static void nvme_process_cq(struct nvme_queue *nvmeq);
 static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown);
+#define NVME_PCI_OUTSTANDING_GRABBING 1
+#define NVME_PCI_OUTSTANDING_GRABBED 2
 
 /*
  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
@@ -80,6 +82,7 @@ struct nvme_dev {
 	struct blk_mq_tag_set admin_tagset;
 	u32 __iomem *dbs;
 	struct device *dev;
+	int grab_flag;
 	struct dma_pool *prp_page_pool;
 	struct dma_pool *prp_small_pool;
 	unsigned online_queues;
@@ -1130,6 +1133,23 @@ static void abort_endio(struct request *req, blk_status_t error)
 	blk_mq_free_request(req);
 }
 
+static void nvme_pci_disable_ctrl_directly(struct nvme_dev *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	u32 csts;
+	bool dead;
+
+	if (!pci_is_enabled(pdev))
+		return;
+
+	csts = readl(dev->bar + NVME_REG_CSTS);
+	dead = !!((csts & NVME_CSTS_CFS) ||
+			!(csts & NVME_CSTS_RDY) ||
+			pdev->error_state  != pci_channel_io_normal);
+	if (!dead)
+		nvme_disable_ctrl(&dev->ctrl, dev->ctrl.cap);
+}
+
 static bool nvme_should_reset(struct nvme_dev *dev, u32 csts)
 {
 
@@ -1191,12 +1211,13 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 
 	/*
 	 * Reset immediately if the controller is failed
+	 * nvme_dev_disable will take over the expired requests.
 	 */
 	if (nvme_should_reset(dev, csts)) {
+		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
 		nvme_warn_reset(dev, csts);
-		nvme_dev_disable(dev, false);
 		nvme_reset_ctrl(&dev->ctrl);
-		return BLK_EH_HANDLED;
+		return BLK_EH_NOT_HANDLED;
 	}
 
 	/*
@@ -1210,38 +1231,51 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 	}
 
 	/*
-	 * Shutdown immediately if controller times out while starting. The
-	 * reset work will see the pci device disabled when it gets the forced
-	 * cancellation error. All outstanding requests are completed on
-	 * shutdown, so we return BLK_EH_HANDLED.
+	 * The previous outstanding requests on adminq and ioq have been
+	 * grabbed or drained for RECONNECTING state, so it must be admin
+	 * request from the nvme_dev_disable or  nvme_reset_work.
+	 * - stop the controller directly
+	 * - set NVME_REQ_CANCELLED, nvme_dev_disable or nvme_reset_work
+	 *   could see this error and stop.
+	 * - return BLK_EH_HANDLED
 	 */
-	if (dev->ctrl.state == NVME_CTRL_RESETTING) {
-		dev_warn(dev->ctrl.device,
-			 "I/O %d QID %d timeout, disable controller\n",
-			 req->tag, nvmeq->qid);
-		nvme_dev_disable(dev, false);
+	if ((READ_ONCE(dev->grab_flag) == NVME_PCI_OUTSTANDING_GRABBED) ||
+		(dev->ctrl.state == NVME_CTRL_RECONNECTING)) {
+		nvme_pci_disable_ctrl_directly(dev);
 		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
 		return BLK_EH_HANDLED;
 	}
 
 	/*
- 	 * Shutdown the controller immediately and schedule a reset if the
- 	 * command was already aborted once before and still hasn't been
- 	 * returned to the driver, or if this is the admin queue.
+	 * nvme_dev_disable is grabbing all the outstanding requests.
+	 * Just set NVME_REQ_CANCELLED and return BLK_EH_NOT_HANDLED.
+	 * The nvme_dev_disable will take over all the things.
+	 */
+	if (READ_ONCE(dev->grab_flag) == NVME_PCI_OUTSTANDING_GRABBING) {
+		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
+		return BLK_EH_NOT_HANDLED;
+	}
+
+	/*
+	 * If the controller is DELETING, needn't to do any recovery,
+	 */
+	if (dev->ctrl.state == NVME_CTRL_DELETING) {
+		nvme_pci_disable_ctrl_directly(dev);
+		nvme_req(req)->status = NVME_SC_ABORT_REQ;
+		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
+		return BLK_EH_HANDLED;
+	}
+	/*
+	 * Just set NVME_REQ_CANCELLED and return BLK_EH_NOT_HANDLED,
+	 * The nvme_dev_disable will take over all the things.
 	 */
 	if (!nvmeq->qid || iod->aborted) {
 		dev_warn(dev->ctrl.device,
 			 "I/O %d QID %d timeout, reset controller\n",
 			 req->tag, nvmeq->qid);
-		nvme_dev_disable(dev, false);
 		nvme_reset_ctrl(&dev->ctrl);
-
-		/*
-		 * Mark the request as handled, since the inline shutdown
-		 * forces all outstanding requests to complete.
-		 */
 		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
-		return BLK_EH_HANDLED;
+		return BLK_EH_NOT_HANDLED;
 	}
 
 	if (atomic_dec_return(&dev->ctrl.abort_limit) < 0) {
@@ -2162,6 +2196,66 @@ static void nvme_pci_disable(struct nvme_dev *dev)
 	}
 }
 
+static void nvme_pci_abort_rq(struct request *req, void *data, bool reserved)
+{
+	if (!blk_mq_request_started(req))
+		return;
+
+	dev_dbg_ratelimited(((struct nvme_ctrl *) data)->device,
+				"Abort I/O %d", req->tag);
+
+	nvme_req(req)->status = NVME_SC_ABORT_REQ;
+	blk_abort_request(req);
+}
+/*
+ * Now the controller has been disabled, no interrupt will race with us,
+ * so it is safe to complete them
+ *  - IO requests will be requeued.
+ *  - adminq requests will be failed, the tags will also be freed.
+ */
+static void nvme_pci_cancel_rq(struct request *req, void *data, bool reserved)
+{
+	if (!blk_mq_request_started(req))
+		return;
+
+	dev_dbg_ratelimited(((struct nvme_ctrl *) data)->device,
+				"Cancel I/O %d", req->tag);
+
+	/* controller has been disabled/shtdown, it is safe here to clear
+	 * the aborted_gstate and complete request.
+	 */
+	if (nvme_req(req)->flags | NVME_REQ_CANCELLED)
+		blk_mq_rq_update_aborted_gstate(req, 0);
+	blk_mq_complete_request(req);
+}
+
+
+static void nvme_pci_sync_timeout_work(struct nvme_ctrl *ctrl)
+{
+	struct nvme_ns *ns;
+
+	mutex_lock(&ctrl->namespaces_mutex);
+	/* ensure the timeout_work is queued */
+	list_for_each_entry(ns, &ctrl->namespaces, list)
+		kblockd_schedule_work(&ns->queue->timeout_work);
+
+	list_for_each_entry(ns, &ctrl->namespaces, list)
+		flush_work(&ns->queue->timeout_work);
+	mutex_unlock(&ctrl->namespaces_mutex);
+}
+
+static void nvme_pci_grab_outstanding(struct nvme_dev *dev)
+{
+	blk_mq_tagset_busy_iter(&dev->tagset, nvme_pci_abort_rq, &dev->ctrl);
+	blk_mq_tagset_busy_iter(&dev->admin_tagset,
+			nvme_pci_abort_rq, &dev->ctrl);
+	nvme_pci_sync_timeout_work(&dev->ctrl);
+	/* All the outstanding requests have been grabbed. They are forced to be
+	 * expired, neither irq completion path nor timeout path could take them
+	 * away.
+	 */
+}
+
 static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 {
 	int i;
@@ -2191,6 +2285,10 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 
 	nvme_stop_queues(&dev->ctrl);
 
+	WRITE_ONCE(dev->grab_flag, NVME_PCI_OUTSTANDING_GRABBING);
+	nvme_pci_grab_outstanding(dev);
+	WRITE_ONCE(dev->grab_flag, NVME_PCI_OUTSTANDING_GRABBED);
+
 	if (!dead) {
 		/*
 		 * If the controller is still alive tell it to stop using the
@@ -2208,9 +2306,11 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 
 	nvme_pci_disable(dev);
 
-	blk_mq_tagset_busy_iter(&dev->tagset, nvme_cancel_request, &dev->ctrl);
-	blk_mq_tagset_busy_iter(&dev->admin_tagset, nvme_cancel_request, &dev->ctrl);
+	blk_mq_tagset_busy_iter(&dev->tagset, nvme_pci_cancel_rq, &dev->ctrl);
+	blk_mq_tagset_busy_iter(&dev->admin_tagset,
+			nvme_pci_cancel_rq, &dev->ctrl);
 
+	WRITE_ONCE(dev->grab_flag, 0);
 	/*
 	 * For shutdown case, controller will not be setup again soon. If any
 	 * residual requests here, the controller must have go wrong. Drain and
