@@ -859,7 +859,7 @@ static void nvme_unmap_data(struct nvme_dev *dev, struct request *req)
 	nvme_cleanup_cmd(req);
 	nvme_free_iod(dev, req);
 }
-
+static int g_counter[32] = {0};
 /*
  * NOTE: ns is NULL when called on the admin queue.
  */
@@ -889,6 +889,10 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	blk_mq_start_request(req);
 
+	if ((++g_counter[nvmeq->qid] % 2000) == 0) {
+		printk("Intercept IO %d\n", req->tag);
+		return BLK_STS_OK;
+	}
 	spin_lock_irq(&nvmeq->q_lock);
 	if (unlikely(nvmeq->cq_vector < 0)) {
 		ret = BLK_STS_IOERR;
@@ -1253,6 +1257,7 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 	 */
 	if (READ_ONCE(dev->grab_flag) == NVME_PCI_OUTSTANDING_GRABBING) {
 		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
+		printk("IO %d QID %d is grabbed/n", req->tag, nvmeq->qid);
 		return BLK_EH_NOT_HANDLED;
 	}
 
