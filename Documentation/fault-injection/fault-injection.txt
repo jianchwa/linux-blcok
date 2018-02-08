@@ -30,6 +30,13 @@ o fail_mmc_request
   injects MMC data errors on devices permitted by setting
   debugfs entries under /sys/kernel/debug/mmc0/fail_mmc_request
 
+o NVMe fault injection
+
+  inject NVMe status code and retry flag on devices permitted by setting
+  debugfs entries under /sys/kernel/debug/nvme*/fault_inject. The default
+  status code is NVME_SC_INVALID_OPCODE with no retry. The status code and
+  retry flag can be set via the debugfs.
+
 Configure fault-injection capabilities behavior
 -----------------------------------------------
 
