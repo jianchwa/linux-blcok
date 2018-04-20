@@ -252,6 +252,240 @@ void nvme_cancel_request(struct request *req, void *data, bool reserved)
 }
 EXPORT_SYMBOL_GPL(nvme_cancel_request);
 
+bool nvme_sm_state_ok(enum nvme_sm_state o_state,
+		enum nvme_sm_state t_state)
+{
+	bool ret = false;
+
+	switch (t_state) {
+	case NVME_SM_LIVE:
+		switch (o_state) {
+		case NVME_SM_NEW:
+		case NVME_SM_ADMIN_ONLY:
+		case NVME_SM_LIVE:
+		case NVME_SM_DISABLED:
+		case NVME_SM_SHUTDOWN:
+			ret = true;
+		default:
+			break;
+		}
+		break;
+	case NVME_SM_DISABLED:
+		switch (o_state) {
+		case NVME_SM_LIVE:
+		case NVME_SM_ADMIN_ONLY:
+			ret = true;
+		default;
+			break;
+		}
+		break;
+	case NVME_SM_SHUTDOWN:
+		switch (o_state) {
+		case NVME_SM_LIVE:
+		case NVME_SM_ADMIN_ONLY:
+		case NVME_SM_ERROR:
+			ret = true;
+		default:
+			break;
+		}
+		break;
+	case NVME_SM_ERROR:
+		switch (o_state) {
+		case NVME_SM_NEW:
+		case NVME_SM_DISABLED:
+		case NVME_SM_SHUTDOWN:
+			ret = true;
+		default:
+			break;
+		}
+		break;
+	case NVME_SM_DELETED:
+		switch (o_state) {
+		case NVME_SM_SHUTDOWN:
+		case NVME_SM_ERROR:
+		case NVME_SM_LIVE:
+		case NVME_SM_ADMIN_LIVE:
+			ret = true;
+		default:
+			break;
+		}
+		break;
+	default:
+		BUG_ON();
+	}
+	return ret;
+}
+
+static enum nvme_sm_state
+	nvme_sm_get_next(struct nvme_ctrl *ctrl)
+{
+	enum nvme_sm_state o_state = ctrl->sm.state;
+	enum nvme_sm_state t_state = ctrl->sm.target;
+	enum nvme_sm_state next = NVME_SM_INVALID;
+
+	switch (t_state) {
+	case NVME_SM_LIVE:
+		switch (o_state) {
+		case NVME_SM_NEW:
+		case NVME_SM_DISABLED:
+		case NVME_SM_SHUTDOWN:
+			next = t_state;
+			break;
+		case NVME_SM_ADMIN_ONLY:
+		case NVME_SM_LIVE:
+			next = NVME_SM_DISABLED;
+		default:
+			break;
+		}
+		break;
+	case NVME_SM_DISABLED:
+		switch (o_state) {
+		case NVME_SM_LIVE:
+		case NVME_SM_ADMIN_ONLY:
+			next = t_state;
+		default;
+			break;
+		}
+		break;
+	case NVME_SM_SHUTDOWN:
+		switch (o_state) {
+		case NVME_SM_LIVE:
+		case NVME_SM_ADMIN_ONLY:
+		case NVME_SM_ERROR:
+			next = t_state;
+		default:
+			break;
+		}
+		break;
+	case NVME_SM_DELETED:
+		switch (o_state) {
+		case NVME_SM_SHUTDOWN:
+			next = t_state;
+			break;
+		case NVME_SM_ERROR:
+		case NVME_SM_LIVE:
+		case NVME_SM_ADMIN_LIVE:
+			next = NVME_SM_SHUTDOWN;
+		default:
+			break;
+		}
+		break;
+	default:
+		BUG_ON();
+	}
+
+	return next;
+}
+
+static enum nvme_sm_state
+	nvme_sm_get_staging(enum nvme_sm_state target)
+{
+	enum nvme_sm_state staging = NVME_SM_INVALID;
+
+	switch (target) {
+	case NVME_SM_LIVE:
+		staging = NVME_SM_CONNECTING;
+		break;
+	case NVME_SM_DISABLED:
+		staging = NVME_SM_DISABLED;
+		break;
+	case NVME_SM_SHUTDOWN:
+		staging = NVME_SM_SHUTING_DOWN;
+		break;
+	case NVME_SM_DELETED:
+		staging = NVME_SM_DELETING;
+		break;
+	default:
+		pr_err("Wrong NVMe sm target state %d\n", target);
+		break;
+	}
+	return staging;
+}
+
+static void nvme_sm_transit_work(struct work_struct *work)
+{
+	struct nvme_ctrl *ctrl =
+		container_of(work, struct nvme_ctrl, sm.work);
+	struct nvme_sm *sm = &ctrl->sm;
+	int ret;
+	enum nvme_sm_state next = NVME_SM_INVALID;
+
+	spin_lock(&sm->lock);
+go:
+	next = nvme_sm_get_next(ctrl);
+	sm->state = nvme_sm_get_staging(next);
+	spin_unlock(&sm->lock);
+	ret = ctrl->ops->sm_action(ctrl, next);
+	spin_lock(&sm->lock);
+	if (ret) {
+		/* Only CONNECTING can fail! */
+		BUG_ON(next != NVME_SM_LIVE);
+		pr_err("Failed to transit to LIVE state (error %d)\n", ret);
+		sm->state = NVME_SM_ERROR;
+		sm->target = NVME_SM_DELETED;
+		pr_warn("Deleting it\n");
+		goto go;
+	} else {
+		sm->state = next;
+	}
+	if (sm->state != sm->target)
+		goto go;
+
+	sm->target = NVME_SM_INVALID;
+	spin_unlock(&sm->lock);
+
+	return;
+}
+
+/*
+ * If wait is true:
+ * - wait previous transition to be completed
+ * - go on waiting if fail when race with other callers
+ * - if queue transition successfully, wait it to be
+ *   completed
+ * When the caller has depenency with the sm transition,
+ * wait must be false, otherwise, deadlock will come up.
+ */
+bool nvme_sm_transit(struct nvme_ctrl *ctrl,
+		enum nvme_sm_state target, bool wait)
+{
+	enum nvme_sm_state origin;
+	struct nvme_sm *sm = &ctrl->sm;
+
+retry:
+	/* Wait the ongoing transition to be completed */
+	if (wait)
+		flush_work(&sm->transit_work);
+
+	spin_lock(&sm->lock);
+	/*
+	 * If a transitting is ongoing ?
+	 * We may fail when race the sm->lock with other callers
+	 * If wait, go on waiting transition to be completed and
+	 * try again later, otherwise, return failed.
+	 */
+	if (sm->target != NVME_SM_INVALID) {
+		spin_unlock(&sm->lock);
+		if (wait)
+			goto retry;
+		else
+			return false;
+	}
+	if (!nvme_sm_state_ok(sm->state, target)) {
+		spin_unlock(&sm->lock);
+		return false;
+	}
+	sm->target = target;
+	queue_work(nvme_wq, &sm->transit_work);
+	spin_unlock(&sm->lock);
+
+	/* Wait the submitted transition to be completed */
+	if (wait)
+		flush_work(&sm->transit_work);
+	return true;
+}
+
+
 bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
 		enum nvme_ctrl_state new_state)
 {
@@ -3400,6 +3634,13 @@ static void nvme_free_ctrl(struct device *dev)
 		nvme_put_subsystem(subsys);
 }
 
+void nvme_init_sm(struct nvme_sm *sm)
+{
+	sm->state = NVME_SM_NEW;
+	sm->target = NVME_SM_INVALID;
+	INIT_WORK(&sm->transit_work, nvme_sm_transit_work);
+	spin_lock_init(&sm->lock);
+}
 /*
  * Initialize a NVMe controller structures.  This needs to be called during
  * earliest initialization so that we have the initialized structured around
@@ -3421,6 +3662,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
 	INIT_WORK(&ctrl->async_event_work, nvme_async_event_work);
 	INIT_WORK(&ctrl->fw_act_work, nvme_fw_act_work);
 	INIT_WORK(&ctrl->delete_work, nvme_delete_ctrl_work);
+	nvme_init_sm(&ctrl->sm);
 
 	ret = ida_simple_get(&nvme_instance_ida, 0, 0, GFP_KERNEL);
 	if (ret < 0)

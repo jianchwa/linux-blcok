@@ -112,6 +112,51 @@ static inline struct nvme_request *nvme_req(struct request *req)
 	return blk_mq_rq_to_pdu(req);
 }
 
+/*
+ * nvme state machine's states diagram
+ *
+ *        (Disabled)   <-   Resetting
+ *             |               ^
+ *             v               |
+ * (New) -> Connecting -> (Live/Admin_live)
+ *             ^   \           |
+ *             |     > Error_ _|
+ *             |               v
+ *         (Shutdown)  <-  Shuting down
+ *             |
+ *             V
+ *         Deleting
+ *             |
+ *             V
+ *         (Deleted)
+ *
+ * The (state) is the target state.
+ * The *ing state is internal state to mark the progress.
+ * The state can transit one by one.
+ * There could be also multiple state linked together.
+ * Possible linked state:
+ * - Live/Admin_live -> Disabled -> Live/Admin_live
+ *   reset procedure
+ * - Live/Admin_live -> Shutdown -> Deleted
+ *   delete procedure
+ * - Error -> Shutdown -> Deleted
+ *   reset fails
+ */
+enum nvme_sm_state {
+	NVME_SM_NEW,
+	NVME_SM_CONNECTING,
+	NVME_SM_ERROR,
+	NVME_SM_ADMIN_ONLY,
+	NVME_SM_LIVE,
+	NVME_SM_RESETTING,
+	NVME_SM_DISABLED,
+	NVME_SM_SHUTING_DOWN,
+	NVME_SM_SHUTDOWN,
+	NVME_SM_DELETING,
+	NVME_SM_DELETED,
+	NVME_SM_INVALID,
+};
+
 /* The below value is the specific amount of delay needed before checking
  * readiness in case of the PCI_DEVICE(0x1c58, 0x0003), which needs the
  * NVME_QUIRK_DELAY_BEFORE_CHK_RDY quirk enabled. The value (in ms) was
@@ -129,8 +174,15 @@ enum nvme_ctrl_state {
 	NVME_CTRL_DEAD,
 };
 
+struct nvme_sm {
+	enum nvme_ctrl_state state;
+	enum nvme_sm_state target;
+	struct work_struct transit_work;
+	spinlock_t lock;
+};
 struct nvme_ctrl {
 	enum nvme_ctrl_state state;
+	struct nvme_sm sm;
 	bool identified;
 	spinlock_t lock;
 	const struct nvme_ctrl_ops *ops;
@@ -312,6 +364,7 @@ struct nvme_ctrl_ops {
 	void (*delete_ctrl)(struct nvme_ctrl *ctrl);
 	int (*get_address)(struct nvme_ctrl *ctrl, char *buf, int size);
 	int (*reinit_request)(void *data, struct request *rq);
+	int (*sm_action)(struct nvme_ctrl *ctrl, enum nvme_sm_state next);
 };
 
 #ifdef CONFIG_FAULT_INJECTION_DEBUG_FS
