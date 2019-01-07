@@ -540,4 +540,9 @@ config DM_ZONED
 
 	  If unsure, say N.
 
+config SCACHE
+	tristate "Simple block cache"
+	---help---
+	This is just toy code.
+
 endif # MD
