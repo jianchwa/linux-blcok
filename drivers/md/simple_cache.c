@@ -18,6 +18,7 @@ static int sc_major;
 static DEFINE_IDA(sc_minor);
 struct kmem_cache *sc_io_cache;
 
+static struct workqueue_struct *sc_workqueue;
 /*
  * List containing all of the sc_backing_dev.
  */
@@ -27,7 +28,19 @@ static LIST_HEAD(sc_all_backing_dev);
  */
 static struct mutex sc_all_backing_dev_lock;
 
-static sc_entry_t *sc_get_mapping_entry(struct sc_backing_dev *scbd, sector_t sec);
+static unsigned int sc_get_mapping_entry(struct sc_backing_dev *scbd, sector_t sec);
+
+struct sc_multi_io {
+	atomic_t bios;
+	wait_queue_head_t waitq;
+};
+
+static void sc_multi_io_endio(struct bio *bio)
+{
+	struct sc_multi_io *mio = bio->bi_private;
+	if (!atomic_dec_return(&mio->bios))
+		wake_up(&mio->waitq);
+}
 
 static void sc_start_io_acct(struct sc_io *sio)
 {
@@ -152,13 +165,11 @@ void sc_writeback_end(struct bio *clone)
 	struct sc_io *sio = clone->bi_private;
 	struct sc_backing_dev *scbd = sio->scbd;
 	struct bio *bio = sio->front_bio;
-	sc_entry_t *entry;
 
 	sc_end_io_acct(sio);
 
 	bio->bi_status = clone->bi_status;
 	if (!bio->bi_status && op_is_write(bio_op(bio))) {
-		entry = sc_get_mapping_entry(scbd, bio->bi_iter.bi_sector);
 
 	}
 	bio_endio(bio);
@@ -167,7 +178,7 @@ void sc_writeback_end(struct bio *clone)
 
 static bool sc_cache_clear(struct sc_cache_info *sci)
 {
-	unsigned long new, old;
+	uint64_t new, old;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
@@ -186,7 +197,7 @@ static bool sc_cache_clear(struct sc_cache_info *sci)
 
 static bool sc_cache_invalidate(struct sc_cache_info *sci)
 {
-	unsigned long new, old;
+	uint64_t new, old;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
@@ -204,9 +215,9 @@ static bool sc_cache_invalidate(struct sc_cache_info *sci)
 	}
 }
 
-static unsigned long sc_calc_new(unsigned long old)
+static unsigned long sc_calc_new(uint64_t old)
 {
-	unsigned int now, last, avg, inv, inflight;
+	uint64_t now, last, avg, inv, inflight;
 
 	now = jiffies;
 	last = SC_CACHE_INFO_LAST(old);
@@ -225,14 +236,14 @@ static unsigned long sc_calc_new(unsigned long old)
 void sc_wait_invalidate(struct sc_backing_dev *scbd,
 		struct sc_cache_info *sci)
 {
-	wait_event(&scbd->wait_invalidate,
+	wait_event(scbd->wait_invalidate,
 			!SC_CACHE_INFO_INFLIGHT(READ_ONCE(sci->status)));
 }
 
 static bool sc_cache_access(struct sc_backing_dev *scbd,
 		struct sc_cache_info *sci)
 {
-	unsigned long old, new;
+	uint64_t old, new;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
@@ -243,7 +254,7 @@ static bool sc_cache_access(struct sc_backing_dev *scbd,
 				 * and last access time has been checked, so this should not be
 				 * a frequent case.
 				 */
-				pr_info("Accessing a cache block with being invalidated %lx\n",
+				pr_info("Accessing a cache block with being invalidated %llx\n",
 						sci->block);
 				sc_wait_invalidate(scbd, sci);
 			}
@@ -266,8 +277,7 @@ static bool sc_cache_access(struct sc_backing_dev *scbd,
 	}
 }
 
-static bool sc_cache_alloc(struct sc_backing_dev *scbd,
-		sc_entry_t *se, int block)
+static bool sc_cache_alloc(struct sc_backing_dev *scbd, int block)
 {
 	/*
 	 * Update the se to indicate we are allocating, then
@@ -275,6 +285,7 @@ static bool sc_cache_alloc(struct sc_backing_dev *scbd,
 	 *
 	 * So we need a bit that shows allocating.
 	 */
+	return true;
 }
 
 static blk_qc_t sc_writeback(struct sc_io *sio)
@@ -284,17 +295,19 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 	struct bio *clone = &sio->clone;
 	struct bio *bio = sio->front_bio;
 	sector_t offset = bio->bi_iter.bi_sector;
-	sc_entry_t *e;
+	unsigned int cblock;
 
-	e = sc_get_mapping_entry(scbd, offset);
-	if (SC_CACHE_VALID(READ_ONCE(e->data))) {
+	cblock = sc_get_mapping_entry(scbd, offset);
+	if (cblock) {
 	
 		/*
 		 * Cache hit, write to cache directly
 		 */
 		__bio_clone_fast(clone, bio);
+#if 0
 		clone->bi_iter.bi_sector =
 			SC_CACHE_LBA(READ_ONCE(e->data), sb) + (offset - (offset & sb->bszmask));
+#endif
 		bio_set_dev(clone, scbd->caching_dev);
 		//clone->bi_end_io = sio_writeback_end;
 		clone->bi_private = sio;
@@ -415,7 +428,287 @@ static const struct sysfs_ops sc_bd_sysfs_ops = {
 	.store	= sc_bd_attr_store,
 };
 
-void sc_block_wait(struct sc_backing_dev *scbd)
+/*
+ * Sounds like awkward,
+ * if we patch all, return 0
+ * if we stop halfway, return the position where we stop.
+ * Note, the unit is not bytes, but sc_log_t
+ */
+static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, int nr)
+{
+	sc_log_t *start, *end;
+	uint32_t data;
+	int i;
+	unsigned long cblock;
+	sc_entry_t *e;
+
+	for (i = 0; i < nr; i++) {
+		start = (sc_log_t *)page_address(pages[i]);
+		end = start + SC_ENTRIES_PER_PAGE;
+		for (; start < end; start++) {
+			data = READ_ONCE(start->data);
+			if (!SC_LOG_VALID(data)) {
+				/*
+				 * run   patch
+				 * +--+  +--+
+				 * |44|  |  |
+				 * |  |  |  |
+				 * +--+  +--+
+				 *
+				 * Replay the running log
+				 */
+				goto out;
+			}
+
+			if (SC_LOG_GEN(data) <= sb->gen) {
+				/*
+				 * run   patch
+				 * +--+  +--+
+				 * |55|  |44|
+				 * |33|  |44|
+				 * +--+  +--+
+				 *
+				 * sb gen
+				 *   2      error
+				 *   3      patch not complete
+				 *   4      patch complete, need run
+				 *   5      error
+				 *
+				 */
+				goto out;
+			}
+			cblock = SC_LOG_BLOCK(data);
+			e = (sc_entry_t *)page_address(sb->map_pages[cblock/SC_ENTRIES_PER_PAGE]);
+			e += cblock % SC_ENTRIES_PER_PAGE;
+			switch(SC_LOG_OPCODE(data)) {
+			case SC_LOG_OP_MAP_SET:
+				/*
+				 * The following log entry contains the bblock
+				 */
+				start++;
+				e->data = SC_ENTRY_CONSTRUCT(start->data, 0, 1);
+				break;
+			case SC_LOG_OP_MAP_CLEAN:
+				e->data = 0;
+				break;
+			case SC_LOG_OP_DIRTY_SET:
+				e->data |= 1 << SC_ENTRY_FLAGS_DIRTY_SHIFT;
+				break;
+			case SC_LOG_OP_DIRTY_CLEAN:
+				e->data &= ~(1 << SC_ENTRY_FLAGS_DIRTY_SHIFT);
+				break;
+			default:
+				WARN_ON(1);
+				break;
+			}
+		}
+	}
+	return 0;
+out:
+	return (i * SC_ENTRIES_PER_PAGE) + (start - (sc_log_t *)page_address(pages[i]));
+}
+
+static unsigned long sc_patch_mapping(struct sc_log_sb *sl, int n)
+{
+ 	int i, nr = sl->sb->block_size / PAGE_SIZE;
+	sector_t start = sl->log_start[n];
+	struct page **pages;
+	struct bio *bio;
+	unsigned long pass, ret;
+
+	pages = kzalloc(sizeof(void *) * nr, GFP_NOIO);
+	BUG_ON(pages);
+
+	for (i = 0; i < nr; i++) {
+		pages[i] = alloc_page(GFP_NOIO);
+		if (!pages[i])
+			break;
+	}
+
+	BUG_ON(i == 0);
+	nr = i;
+repeat:
+	bio = bio_alloc(GFP_NOIO, nr);
+	bio->bi_iter.bi_sector = start;
+	bio_set_dev(bio, sl->dev);
+	bio_set_op_attrs(bio, REQ_OP_READ, REQ_META | REQ_SYNC);
+	for (i = 0; i < nr; i++)
+		bio_add_page(bio, pages[i], PAGE_SIZE, 0);
+
+	/*
+	 * What if the caching device fall into error ?
+	 * We cannot read out anything and data on backing device
+	 * is stale.
+	 */
+	WARN_ON(submit_bio_wait(bio));
+
+	ret = __sc_patch_mapping(sl->sb, pages, nr);
+	
+	bio_put(bio);
+	if (ret) {
+		pass = ((start - sl->log_start[n]) << 9) / SC_CACHE_MAPPING_ENTRY_SIZE;
+		return pass + ret;
+	}
+
+	start += PAGE_SECTORS * nr;
+	if (start < sl->log_len)
+		goto repeat;
+
+	return 0;
+}
+
+/*
+ * TODO:
+ *  - Need to figure out a more efficient way to do patch.
+ */
+static void sc_log_patch_work(struct work_struct *work)
+{
+	struct sc_log_sb *sl = container_of(work, struct sc_log_sb, patch_work);
+	struct sc_sb *sb = sl->sb;
+	sector_t start;
+	int i;
+	struct bio *bio;
+	struct blk_plug plug;
+	int len;
+	struct sc_multi_io mio;
+	struct sc_d_sb *sdb;
+
+	BUG_ON(sl->log_offset[SL_PATCH(sl)] != sl->log_len);
+
+	if (sl->patch)
+		sc_patch_mapping(sl, SL_PATCH(sl));
+	/*
+	 * This is for the sc_log_replay_patch which wants to patch the mapping
+	 * itself and do other things asynchronously.
+	 */
+	sl->patch = true;
+	/*
+	 * submit all of the patched mappings to disk
+	 */
+	len = sb->maplen / PAGE_SIZE;
+	bio = NULL;
+	atomic_set(&mio.bios, 0);
+	init_waitqueue_head(&mio.waitq);
+	start = PAGE_SECTORS;
+	blk_start_plug(&plug);
+	for (i = 0; i < len; i++) {
+		if (!bio) {
+			bio = bio_alloc(GFP_NOIO, BIO_MAX_PAGES);
+			bio->bi_iter.bi_sector = start;
+			bio_set_dev(bio, sl->dev);
+			bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_META | REQ_FUA);
+			bio->bi_private = &mio;
+			bio->bi_end_io = sc_multi_io_endio;
+			atomic_inc(&mio.bios);
+		}
+		if (!bio_add_page(bio, sb->map_pages[i], PAGE_SIZE, 0)) {
+			submit_bio(bio);
+			bio = NULL;
+			continue;
+		}
+		start += PAGE_SECTORS;
+	}
+	if (bio)
+		submit_bio(bio);
+	blk_finish_plug(&plug);
+	wait_event(mio.waitq, (!atomic_read(&mio.bios)));
+	/*
+	 * Update the sb patch version
+	 */
+	sb->gen++;
+	sdb = page_address(sb->sb_page);
+	sdb->gen = sb->gen;
+	bio = bio_alloc(GFP_NOIO, 1);
+	bio->bi_iter.bi_sector = 0;
+	bio_set_dev(bio, sl->dev);
+	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_META | REQ_FUA);
+	bio_add_page(bio, sb->sb_page, PAGE_SIZE, 0);
+	WARN_ON(submit_bio_wait(bio));
+	/*
+	 * write log_offset, wakeup the waiters
+	 * FIXME
+	 *   Do we need a memory barrier here ?
+	 */
+	sl->log_offset[SL_PATCH(sl)] = 0;
+	wake_up(&sl->waitq);
+}
+
+static void sc_log_insert_work(struct work_struct *work)
+{
+	struct sc_log_sb *sl = container_of(work, struct sc_log_sb, insert_work);
+	uint32_t *addr = page_address(sl->log_page);
+	int offset = sl->log_page_offset;
+	struct llist_node *first, *node, *stop;
+	struct sc_log_item *sli;
+	struct bio *bio = &sl->log_bio;
+
+	first = llist_del_all(&sl->list);
+repeat:
+	if (!first)
+		return;
+	stop = NULL;
+	llist_for_each(node, first){
+		sli = container_of(node, struct sc_log_item, node);
+		/*
+		 * The previous log entries will be overwritten.
+		 */
+		addr[offset] = sli->data;
+		offset++; /* so the offset's unit is uint32_t */
+		if (SC_LOG_OPCODE(sli->data) == SC_LOG_OP_MAP_SET) {
+			addr[offset] = sli->bb;
+			offset++;
+		}
+		if (offset >= SC_ENTRIES_PER_PAGE) {
+			stop = node;
+			offset = 0;
+			break;
+		}
+	}
+	sl->log_page_offset = offset;
+	bio_init(bio, bio->bi_inline_vecs, 1);
+	bio->bi_iter.bi_sector = sl->log_offset[SL_RUN(sl)] + sl->log_start[SL_RUN(sl)];
+	bio_set_dev(bio, sl->dev);
+	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_FUA | REQ_META);
+	bio_add_page(bio, sl->log_page, PAGE_SIZE, 0);
+	WARN_ON(submit_bio_wait(bio));
+	
+	llist_for_each(node, first){
+		sli = container_of(node, struct sc_log_item, node);
+		sli->log_done(sli->private);
+		if (node == stop)
+			break;
+	}
+
+	/*
+	 * Turn page
+	 */
+	if (stop) {
+		sl->log_offset[SL_RUN(sl)] += PAGE_SECTORS;
+		if (sl->log_offset[SL_RUN(sl)] >= sl->log_len) {
+			/*
+			 * Check and wait the previous patch work complete
+			 */
+			wait_event(sl->waitq,
+				(!READ_ONCE(sl->log_offset[SL_PATCH(sl)])));
+			sl->toggle ^= 1;
+			queue_work(sc_workqueue, &sl->patch_work);
+		}
+		first = stop->next;
+		goto repeat;
+	}
+}
+
+static void sc_log_insert(struct sc_log_item *sli)
+{
+	struct sc_log_sb *sl = sli->sl;
+	/*
+	 * If the first one, queue the work
+	 */
+	if (llist_add(&sli->node, &sl->list))
+		queue_work(sc_workqueue, &sl->insert_work);
+}
+
+static void sc_block_wait(struct sc_backing_dev *scbd)
 {
 	DEFINE_WAIT(wait);
 
@@ -515,21 +808,47 @@ static void sc_block_free(struct sc_backing_dev *scbd, int block)
 		wake_up(&scbd->wait_block);
 }
 
+static struct sc_cache_info *sc_get_cache_info(struct sc_backing_dev *scbd, int cblock)
+{
+	int sci_per_page = PAGE_SIZE / sizeof(struct sc_cache_info);
+
+	if (cblock > scbd->scis_total)
+		return NULL;
+	return &scbd->scis[cblock/sci_per_page][cblock%sci_per_page];
+}
+
+
 static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 {
 	int i;
 	struct sc_sb *sb = scbd->sb;
-	uint64_t depth, slot;
+	uint64_t depth, slot, len;
+	int sci_per_page;
 	sector_t caching_size = part_nr_sects_read(scbd->caching_dev->bd_part);
 
 	depth = round_down((caching_size << 9), sb->block_size);
-	depth -= round_up(sb->mlen, sb->block_size);
+	depth -= round_up(sb->maplen, sb->block_size);
 	depth /= sb->block_size;
 
-	scbd->scis = kzalloc(sizeof(struct sc_cache_info) * depth, GFP_KERNEL);
+	scbd->scis_total = depth;
+	sci_per_page = PAGE_SIZE / sizeof(struct sc_cache_info);
+	len = (depth / sci_per_page) + 1;
+
+	scbd->scis = kzalloc(sizeof(void *) * len, GFP_KERNEL);
 	if (!scbd->scis) {
 		pr_err("Failed to allocate sc_cache_info array\n");
 		return -ENOMEM;
+	}
+	scbd->scis_arrary_len = len;
+	for (i = 0; i < len; i++) {
+		scbd->scis[i] = kzalloc(PAGE_SIZE, GFP_KERNEL);
+		if (!scbd->scis[i]) {
+			pr_err("Failed to allocate sc_cache_info entry\n");
+			for (; i >=0; i--)
+				kfree(scbd->scis[i]);
+			kfree(scbd->scis);
+			return -ENOMEM;
+		}
 	}
 	pr_info("available blocks in caching device %llu\n", depth);
 
@@ -569,6 +888,9 @@ static void sc_block_allocator_destroy(struct sc_backing_dev *scbd)
 {
 	int i;
 
+	for (i = 0; i < scbd->scis_arrary_len; i++)
+		kfree(scbd->scis[i]);
+	kfree(scbd->scis);
 	for (i = 0; i < SC_MAX_BITMAP_SLOTS; i++)
 		kfree(scbd->slots[i].map);
 }
@@ -579,22 +901,24 @@ static int sc_cache_format(struct sc_backing_dev *scbd,
 	struct block_device *cbdev = scbd->caching_dev;
 	struct sc_d_sb *dsb = page_address(page);
 	uint32_t block_size = scbd->setting.block_size;
-	sector_t backing_size = part_nr_sects_read(scbd->backing_dev->bd_part);
-	uint64_t mlen;
+	sector_t caching_size = part_nr_sects_read(scbd->caching_dev->bd_part);
+	uint64_t maplen, total;
 	sector_t offset, end;
 	int ret;
 
-	mlen = round_up((backing_size << 9), block_size) / block_size;
-	mlen *= SC_CACHE_MAPPING_ENTRY_SIZE;
-	mlen += 512; /* superblock sector */
-	mlen = round_up(mlen, PAGE_SIZE); /* Just for convenience of read/write */
+	maplen = round_up((caching_size << 9), block_size) / block_size;
+	maplen *= SC_CACHE_MAPPING_ENTRY_SIZE;
+	maplen = round_up(maplen, PAGE_SIZE); /* Just for convenience of read/write */
 
-	pr_info("backing capacity is %lu G Bytes mlen %lu M Bytes\n",
-			(unsigned long)(backing_size << 9) >> 30, (unsigned long)mlen >> 20);
-	pr_info("first available block is %llx\n", round_up(mlen, block_size) >> 9);
+	total = 3 * maplen; /* 1 for mapping array, 2 for log rings */
+	total += PAGE_SIZE; /* superblock sector */
+
+	pr_info("caching capacity is %lu G Bytes maplen %lu K Bytes\n",
+			(unsigned long)(caching_size << 9) >> 30, (unsigned long)maplen >> 10);
+	pr_info("first available block is %llx\n", round_up(total, block_size) >> 9);
 
 	offset = 0;
-	end = mlen >> 9;
+	end = total >> 9;
 
 	memset((void *)dsb, 0, PAGE_SIZE);
 	while (offset < end) {
@@ -608,12 +932,13 @@ static int sc_cache_format(struct sc_backing_dev *scbd,
 			pr_err("Failed to initialize the metadata %d\n", ret);
 			return ret;
 		}
-		offset += PAGE_SIZE;
+		offset += PAGE_SECTORS;
 	}
 
 	dsb->sc_magic = cpu_to_le32(SC_MAGIC_NUMBER);
 	dsb->block_size = cpu_to_le32(block_size);
-	dsb->mlen = cpu_to_le64(mlen);
+	dsb->maplen = cpu_to_le64(maplen);
+	dsb->gen = 0;
 
 	bio_init(bio, bio->bi_inline_vecs, 1);
 	bio->bi_iter.bi_sector = 0;
@@ -675,9 +1000,10 @@ static int sc_get_sb(struct sc_backing_dev *scbd)
 	}
 	sb->block_size = le32_to_cpu(dsb->block_size);
 	sb->bitsbsz2sc = ilog2(sb->block_size) - 9;
-	sb->bszmask = ~(sb->block_size - 1);
-	sb->mlen = le64_to_cpu(dsb->mlen);
-	sb->first_page = page;
+	sb->maplen = le64_to_cpu(dsb->maplen);
+	sb->gen = dsb->gen; /* 8bits needn't convert */
+	pr_info("sb gen %d\n", sb->gen);
+	sb->sb_page = page;
 	scbd->sb = sb;
 
 	bio_put(bio);
@@ -692,31 +1018,22 @@ static void sc_put_sb(struct sc_backing_dev *scbd)
 {
 	struct sc_sb *sb = scbd->sb;
 
-	put_page(sb->first_page);
+	put_page(sb->sb_page);
 	kfree(sb);
 }
 
-static sc_entry_t *sc_get_mapping_entry(struct sc_backing_dev *scbd, sector_t sec)
+static unsigned int sc_get_mapping_entry(
+	struct sc_backing_dev *scbd, sector_t sec)
 {
 	struct sc_sb *sb = scbd->sb;
 	int block = sec >> sb->bitsbsz2sc;
+	struct sc_cache_entry *entry;
 
-	block += SC_MAPPING_FIRST_PAGE_OFFSET;
+	entry = sb->mappings[block / SC_ENTRIES_PER_PAGE];
 
-	return &sb->mappings[block / SC_ENTRIES_PER_PAGE][block % SC_ENTRIES_PER_PAGE];
-}
+	entry += (block % SC_ENTRIES_PER_PAGE);
 
-struct sc_setup_mapping_data {
-	atomic_t bios;
-	wait_queue_head_t waitq;
-};
-
-static void sc_read_mapping_endio(struct bio *bio)
-{
-	struct sc_setup_mapping_data *data = bio->bi_private;
-
-	if (!atomic_dec_return(&data->bios))
-		wake_up(&data->waitq);
+	return entry->cb;
 }
 
 static int sc_read_mapping(struct sc_backing_dev *scbd)
@@ -725,17 +1042,16 @@ static int sc_read_mapping(struct sc_backing_dev *scbd)
 	struct bio *bio = NULL;
 	sector_t offset;
 	int i, len;
-	struct sc_setup_mapping_data data;
+	struct sc_multi_io mio;
 	struct blk_plug plug;
 
-	atomic_set(&data.bios, 0);
-	init_waitqueue_head(&data.waitq);
-	/*
-	 * First page has been read in.
-	 */
-	offset = PAGE_SECTORS;
-	len = sb->mlen / PAGE_SIZE - 1;
-	i = 1;
+	atomic_set(&mio.bios, 0);
+	init_waitqueue_head(&mio.waitq);
+
+	offset = SC_MAPPING_START;
+	len = sb->maplen / PAGE_SIZE;
+	i = 0;
+
 	blk_start_plug(&plug);
 	while (len) {
 		if (!bio) {
@@ -743,9 +1059,9 @@ static int sc_read_mapping(struct sc_backing_dev *scbd)
 			bio_set_dev(bio, scbd->caching_dev);
 			bio->bi_iter.bi_sector = offset;
 			bio_set_op_attrs(bio, REQ_OP_READ, 0);
-			bio->bi_end_io = sc_read_mapping_endio;
-			bio->bi_private = &data;
-			atomic_inc(&data.bios);
+			bio->bi_end_io = sc_multi_io_endio;
+			bio->bi_private = &mio;
+			atomic_inc(&mio.bios);
 		}
 		if (!bio_add_page(bio, sb->map_pages[i], PAGE_SIZE, 0)) {
 			submit_bio(bio);
@@ -759,37 +1075,58 @@ static int sc_read_mapping(struct sc_backing_dev *scbd)
 	if (bio)
 		submit_bio(bio);
 	blk_finish_plug(&plug);
-	wait_event(data.waitq, !atomic_read(&data.bios));
+	wait_event(mio.waitq, !atomic_read(&mio.bios));
 
 	return 0;
+}
+
+static inline void sc_cache_entry_set(struct sc_sb *sb,
+		unsigned long bblock, unsigned long cblock)
+{
+	struct sc_cache_entry *entry;
+
+	entry = sb->mappings[bblock / SC_ENTRIES_PER_PAGE];
+	entry += bblock % SC_ENTRIES_PER_PAGE;
+	entry->cb = cblock;
 }
 
 static int sc_handle_mapping_early(struct sc_backing_dev *scbd)
 {
 	struct sc_sb *sb = scbd->sb;
-	int i, len = sb->mlen / PAGE_SIZE;
+	int i, len = sb->maplen / PAGE_SIZE;
 	sc_entry_t *start, *end;
 	struct sc_cache_info *sci;
 	unsigned long cblock, bblock;
+	bool dirty;
+	uint32_t data;
 
 	/*
 	 * Pick the used blocks out of block allocator.
 	 */
-	bblock = 0;
+	cblock = 0;
 	for (i = 0; i < len; i++) {
-		start = sb->mappings[i];
+		start = page_address(sb->map_pages[i]);
 		end = start + SC_ENTRIES_PER_PAGE;
-		if (i == 0)
-			start += SC_MAPPING_FIRST_PAGE_OFFSET;
 		for (; start < end; start++) {
-			bblock++;
-			if (SC_CACHE_VALID(READ_ONCE(start->data))) {
-				cblock = SC_CACHE_BLOCK(READ_ONCE(start->data));
+			data = READ_ONCE(start->data);
+			if (SC_ENTRY_VALID(data)) {
+				bblock = SC_ENTRY_BLOCK(data);
+				if (bblock > sb->bmaplen/SC_CACHE_MAPPING_ENTRY_SIZE) {
+					pr_err("mapping entry is corrupted, bb %lx\n", bblock);
+					continue;
+				}
+				dirty = SC_ENTRY_DIRTY(data);
 				sc_block_set(scbd, cblock);
-				sci = &scbd->scis[cblock];
-				sci->status = 1; /* valid entry */
+				sci = sc_get_cache_info(scbd, cblock);
+				if (!sci) {
+					pr_warn("Failed to get sci when handle mapping early %lx\n", cblock);
+					continue;
+				}
+				sci->status = SC_CACHE_INFO(0, 0, 0, dirty, 1); /* valid entry */
 				sci->block = bblock; /* reverse mapping */
+				sc_cache_entry_set(sb, bblock, cblock);
 			}
+			cblock++;
 		}
 	}
 
@@ -798,59 +1135,247 @@ static int sc_handle_mapping_early(struct sc_backing_dev *scbd)
 
 static int sc_setup_mapping(struct sc_backing_dev *scbd)
 {
+	sector_t backing_size = part_nr_sects_read(scbd->backing_dev->bd_part);
 	struct sc_sb *sb = scbd->sb;
-	int i, ret, len = sb->mlen / PAGE_SIZE;
+	unsigned long clen, blen;
+	int i, ret = -ENOMEM;
 
-
-	sb->map_pages = kzalloc(sizeof(void *) * len, GFP_KERNEL);
+	clen = sb->maplen / PAGE_SIZE;
+	sb->map_pages = kzalloc(sizeof(void *) * clen, GFP_KERNEL);
 	if (!sb->map_pages) {
 		pr_err("Failed to allocate map_pages\n");
-		return -ENOMEM;
-	}
-	sb->mappings = kzalloc(sizeof(void *) * len, GFP_KERNEL);
-	if (!sb->mappings) {
-		pr_err("Failed to allocate mappings\n");
-		ret = -ENOMEM;
-		goto fail_mappings;
+		return ret;
 	}
 
-	sb->map_pages[0] = sb->first_page;
-	sb->mappings[0] = page_address(sb->first_page);
-	for (i = 1; i < len; i++) {
+	for (i = 0; i < clen; i++) {
 		sb->map_pages[i] = alloc_page(GFP_KERNEL);
 		if (!sb->map_pages[i]) {
 			pr_err("Failed to allocate map pages\n");
 			for (; i > 0; i--)
 				put_page(sb->map_pages[i]);
-			ret = -ENOMEM;
 			goto fail_pages;
 		}
-		sb->mappings[i] = page_address(sb->map_pages[i]);
+	}
+	pr_info("%ld pages for mapping on disk\n", clen);
+	blen = (backing_size << 9) / sb->block_size;
+	blen *= SC_CACHE_MAPPING_ENTRY_SIZE;
+
+	pr_info("Backing device capacity %ld G in-core mapping %ld K\n",
+		(backing_size << 9) >> 30, blen >> 10);
+	sb->bmaplen = blen;
+	/*
+	 * We allocate this page by page, then it would be easier to get.
+	 */
+	blen /= PAGE_SIZE;
+	blen += 1;
+	pr_info("%d 4K memory for mapping in-core\n", blen);
+	sb->mappings = kzalloc(sizeof(void *) * blen, GFP_KERNEL);
+	if (!sb->mappings) {
+		pr_err("Failed to allocate mappings\n");
+		goto fail_mappings;
+	}
+
+	for (i = 0; i < blen; i++) {
+		sb->mappings[i] = kzalloc(PAGE_SIZE, GFP_KERNEL);
+		if (!sb->mappings[i]) {
+			pr_err("Failed to allocate mappings entries\n");
+			for (; i >=0; i--)
+			    kfree(sb->mappings[i]);
+			goto fail_mappings;
+		}
 	}
 
 	ret = sc_read_mapping(scbd);
 
-	ret = sc_handle_mapping_early(scbd);
-
+	return 0;
+fail_mappings:
+	for (i = 0; i < clen; i++)
+	    put_page(sb->map_pages[i]);
 fail_pages:
 	kfree(sb->mappings);
-fail_mappings:
-	kfree(sb->map_pages);
 	return ret;
 }
 
 static void sc_destroy_mapping(struct sc_backing_dev *scbd)
 {
 	struct sc_sb *sb = scbd->sb;
-	int i, len = sb->mlen / PAGE_SIZE;
+	int i, len;
+	len = sb->maplen / PAGE_SIZE;
 	/*
 	 * The dirty mapping should have been written out to disk
-	 * First page is freed by sc_put_sb
 	 */
-	for (i = 1; i < len; i++)
+	for (i = 0; i < len; i++)
 		put_page(sb->map_pages[i]);
+
+	len = sb->bmaplen / PAGE_SIZE;
+
+	for (i = 0; i < len; i++)
+		kfree(sb->mappings[i]);
+
 	kfree(sb->mappings);
 	kfree(sb->map_pages);
+}
+
+static int sc_get_log_gen(struct sc_log_sb *sl, int *gen)
+{
+	struct page *page;
+	struct bio *bio;
+	sc_log_t *log;
+	int i;
+
+	page = alloc_page(GFP_KERNEL);
+	
+	for (i = 0; i < 2; i++) {
+		bio = bio_alloc(GFP_KERNEL, 1);
+		bio->bi_iter.bi_sector = sl->log_start[i];
+		bio_set_dev(bio, sl->dev);
+		bio_set_op_attrs(bio, REQ_OP_READ, REQ_META | REQ_SYNC);
+		bio_add_page(bio, page, 512, 0);
+		WARN_ON(submit_bio_wait(bio));
+		log = page_address(page);
+		gen[i] = SC_LOG_GEN(log->data);
+		bio_put(bio);
+	}
+	put_page(page);
+
+	return 0;
+}
+
+static void sc_log_replay_patch(struct sc_log_sb *sl, int n)
+{
+	sl->toggle = n ^ 1; /* toggle ^ 1 is patching one */
+	sl->log_offset[SL_PATCH(sl)] = sl->log_len;
+
+	sc_patch_mapping(sl, SL_PATCH(sl));
+	sl->patch = false;
+
+	queue_work(sc_workqueue, &sl->patch_work);
+}
+
+static void sc_log_replay_run(struct sc_log_sb *sl, int n)
+{
+	unsigned long ret;
+	
+	sl->toggle = n; /* toggle is running */
+
+	ret = sc_patch_mapping(sl, n);
+	sl->log_offset[SL_RUN(sl)] = (ret / SC_ENTRIES_PER_PAGE) * PAGE_SECTORS;
+	sl->log_page_offset = ret & (~SC_ENTRIES_PER_PAGE);
+}
+
+/*
+ * Most of time, the log is as following
+ *
+ * run   patch
+ * +--+  +--+
+ * |55|  |44|
+ * |33|  |44|
+ * +--+  +--+
+ *
+ * sb gen
+ *   2      error
+ *   3      patch not complete
+ *   4      patch complete, need run
+ *   5      error
+ *
+ * What we need to do here is:
+ * 1. get the version of the two log and figure out the running
+ *    and patching one through the first log entry's gen number
+ * 2. patch the logs of which version is bigger than sb->gen on in-core mapping
+ * 3. set the log with version sb->gen + 1 as patching log, and another as
+ *    running one.
+ * 4. figure out the postion we start to log in the running log
+ */
+static int sc_replay_log(struct sc_backing_dev *scbd)
+{
+	struct sc_sb *sb = scbd->sb;
+	struct sc_log_sb *sl = &sb->log;
+	int gen[2], patch = -1, run = -1;
+
+	sc_get_log_gen(sl, gen);
+
+	pr_info("log 0 gen %d log 1 gen %d sb gen %d\n", gen[0], gen[1], sb->gen);
+
+	if (gen[0] <= sb->gen && gen[1] <= sb->gen)
+		return 0;
+
+	if (gen[0] > sb->gen && gen[1] > sb->gen) {
+		if (gen[0] == sb->gen + 1) {
+			patch = 0;
+			WARN_ON(gen[1] != sb->gen + 2);
+			run = 1;
+		} else if (gen[1] == sb->gen + 1) {
+			patch = 1;
+			WARN_ON(gen[0] != sb->gen + 2);
+			run = 0;
+		} else {
+			WARN_ON(1);
+		}
+	}
+
+	if (gen[0] == sb->gen) {
+		WARN_ON((gen[1] != sb->gen + 1));
+		run = 1;
+	}
+
+	if (gen[1] == sb->gen) {
+		WARN_ON((gen[0] != sb->gen + 1));
+		run = 0;
+	}
+
+	/*
+	 * patch means we need to patch the whole log into mapping and
+	 * need to flush them into disk asynchronously.
+	 */
+	if (patch >= 0)
+		sc_log_replay_patch(sl, patch);
+
+	/*
+	 * run means we need to patch the log entries that have bigger
+	 * gen than sb->gen and need to set the log_offset and log_page_offset.
+	 */
+	if (run >= 0)
+		sc_log_replay_run(sl, patch);
+
+	return 0;
+}
+
+static int sc_setup_log(struct sc_backing_dev *scbd)
+{
+	struct sc_sb *sb = scbd->sb;
+	struct sc_log_sb *sl = &sb->log;
+
+	sl->sb = sb;
+	sl->dev = scbd->caching_dev;
+	sl->log_start[0] = (PAGE_SIZE + sb->maplen) >> 9;
+	sl->log_start[1] = (PAGE_SIZE + 2 * sb->maplen) >> 9;
+	sl->log_offset[0] = 0;
+	sl->log_offset[1] = 0;
+	init_llist_head(&sl->list);
+	sl->toggle = 0;
+	sl->patch = true;
+	sl->log_page_offset = 0;
+	sl->log_len = sb->maplen >> 9;
+
+	INIT_WORK(&sl->insert_work, sc_log_insert_work);
+	INIT_WORK(&sl->patch_work, sc_log_patch_work);
+	init_waitqueue_head(&sl->waitq);
+
+	sl->log_page = alloc_page(GFP_KERNEL);
+	if (!sl->log_page) {
+		pr_err("Failed to get log page\n");
+		return -ENOMEM;
+	}
+	memset(page_address(sl->log_page), 0, PAGE_SIZE);
+	return 0;
+}
+
+static void sc_destroy_log(struct sc_backing_dev *scbd)
+{
+	struct sc_sb *sb = scbd->sb;
+	struct sc_log_sb *sl = &sb->log;
+
+	put_page(sl->log_page);
 }
 
 static int sc_setup_cache(struct sc_backing_dev *scbd)
@@ -866,12 +1391,23 @@ static int sc_setup_cache(struct sc_backing_dev *scbd)
 		goto fail_ba;
 
 	ret = sc_setup_mapping(scbd);
+	if (ret)
+		goto fail_sm;
+	ret = sc_setup_log(scbd);
+	if (ret)
+		goto fail_log;
+	ret = sc_replay_log(scbd);
+	ret = sc_handle_mapping_early(scbd);
 	/*
 	 * writeabck is ready
 	 */
 
 	return ret;
 
+fail_log:
+	sc_destroy_mapping(scbd);
+fail_sm:
+	sc_block_allocator_destroy(scbd);
 fail_ba:
 	sc_put_sb(scbd);
 out:
@@ -918,7 +1454,7 @@ static ssize_t sc_bd_cache_store(struct sc_backing_dev *scbd,
 		err = len;
 		goto fail_bdev;
 	}
-
+	scbd->caching_dev = NULL;
 	bd_unlink_disk_holder(bdev, scbd->front_disk);
 fail_link_holder:
 	blkdev_put(bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
@@ -1275,8 +1811,18 @@ static int __init sc_init(void)
 		ret = -ENOMEM;
 		goto fail_io_cache;
 	}
-	return 0;
 
+	sc_workqueue = alloc_workqueue("scached",
+					    WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
+	if (!sc_workqueue) {
+		pr_err("Failed to build sc workqueue\n");
+		ret = -ENOMEM;
+		goto fail_wq;
+	}
+
+	return 0;
+fail_wq:
+	kmem_cache_destroy(sc_io_cache);
 fail_io_cache:
 	unregister_blkdev(sc_major, "sc");
 fail_sc_files:
@@ -1287,6 +1833,8 @@ fail:
 
 static void __init sc_exit(void)
 {
+
+	kmem_cache_destroy(sc_io_cache);
 	kobject_put(sc_sysfs_kobj);
 	unregister_blkdev(sc_major, "sc");
 	mutex_destroy(&sc_all_backing_dev_lock);

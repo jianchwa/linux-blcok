@@ -33,8 +33,6 @@ enum sc_cache_mode {
 };
 
 /*
- * (Assume machine is 64bit. I have to do this because I need
- * more information in 'status' field)
  *
  * 63    48 47   32 31           2 1 0
  * |-------|-------|-------------|-|-|
@@ -50,8 +48,8 @@ enum sc_cache_mode {
  * invalidated before this. (Our GC period is less than 30s)
  */
 struct sc_cache_info {
-	unsigned long status;
-	unsigned long block; /* block of backing device */
+	uint64_t status;
+	uint64_t block; /* block of backing device */
 };
 
 #define SC_CACHE_INFO_VALID(i) (i & 0x1)
@@ -60,7 +58,7 @@ struct sc_cache_info {
 #define SC_CACHE_INFO_LAST(i) (i >> 48)
 #define SC_CACHE_INFO_AVG(i) ((i >> 32) & 0xffff)
 #define SC_CACHE_INFO(l, a, f, d, i) \
-	((l << 48) | ((a << 32) & 0xffff) | \
+	(((uint64_t)l << 48) | (((uint64_t)a << 32) & 0xffff) | \
 	 ((f & 0xffffffff) << 2) | \
 	 (d << 1) | i)
 
@@ -111,7 +109,9 @@ struct sc_backing_dev {
 	unsigned long slot_available;
 	struct sc_bitmap_slot slots[SC_MAX_BITMAP_SLOTS];
 	wait_queue_head_t wait_block;
-	struct sc_cache_info *scis; /* sc_cache_info array */
+	struct sc_cache_info **scis; /* sc_cache_info array */
+	int scis_arrary_len;
+	unsigned long scis_total;
 	wait_queue_head_t wait_invalidate;
 
 	struct gendisk *front_disk;
@@ -147,37 +147,61 @@ struct sc_sysfs_entry {
 /*
  * caching and backing block mapping
  *
- * Most capacity of caching device is 1T (2^40)
- * Smallest block size is 64K (2^16)
- *
- * So we need 24 bits per entry at most for caching device lba
- * 
- * 31                8 7             0
- * |-------------------|--------------|
+ * 31                 2 1 0
+ * |-------------------|--|
  * \________ _________/ 
  *          V
  *     caching lba
  *
- * bit 31 ~ 8 	cache lba in block_size 
- * bit 7 ~ 0 	entry flags
+ * bit 31 ~ 2 	backing device lba in block_size 
+ * bit 1 ~ 0 	entry flags
  *
- * bit 0 	valid/invalid
- * bit 1 	dirty/clean
+ * bit 0	valid/invalid
+ * bit 1	dirty/clean
  *
- * others 	reserved
- *
- * Metadata size = (backing_capacity/block_size) * 4 bytes
+ * When the block size is 64K, the largest capacity of backing
+ * device is 64T (2^46)
+ * Every available cache block has an 4 bytes entry.
+ * Metadata size = (caching_capability/block_size) * 4 bytes
  * 
- * Backing capacity    Block size    Metadata size
- *              1T           512K    8M
- *              1T           256K    16M
- *              1T           128K    32M
- *              1T            64K    64M
+ * Caching capacity    Block size    Metadata size
+ *            256G           512K     2M
+ *            256G            64K    16M
+ *             32G            64K     2M
+ *
+ * Mapping update log entry
+ * 
+ * 31              8 7 3 2 0
+ * |----------------|---|--|
+ * 
+ * bit 31 ~ 8 	caching device lba in block_size
+ *              most capacity of caching device is 1T and smallest
+ *              block is 64K, so we need 24 bits for address at least.
+ * bit 7 ~ 3 	generation number, every round of the log ring is a
+ * 		generation.
+ * bit 2 ~ 0 	opcode
+ *
+ * opcode
+ * 0 		mapping set
+ * 1 		mapping clear
+ * 2 		dirty set
+ * 3 		drity clear
+ * 4 ~ 7 	reserved
+ *
+ * The mapping log area is 2 times of mapping entry array.
+ * So we have 2 log rings. When one is full, we switch to another one
+ * with generation + 1, then start to use the previous one to patch
+ * mapping entry array. When patch is completed, we need to update the
+ * super block generation field.
+ *
  * Metadata is reserved after the super block sector as following.
  *
  *             +--------+ superblock sector (1 sector)
+ *             +--------+ padding for PAGE_SIZE alignement
  *             +--------+
  *             |        | mapping
+ *             +--------+
+ *             |        | log rings
  *             |        |
  *             +--------+ padding for block size alignement
  *             +--------+
@@ -188,34 +212,117 @@ struct sc_sysfs_entry {
  *             .        .
  *             |        |
  *             +--------+
- *
- *
  */
 
 #define SC_DEFAULT_CACHE_BLOCK_SIZE 131072 /* 128K Bytes */
 #define SC_CACHE_MAPPING_ENTRY_SIZE 4 /* Bytes */
 #define SC_ENTRIES_PER_PAGE (PAGE_SIZE / SC_CACHE_MAPPING_ENTRY_SIZE)
 #define SC_MAPPING_FIRST_PAGE_OFFSET (512 / SC_CACHE_MAPPING_ENTRY_SIZE)
-
+#define SC_MAPPING_START PAGE_SECTORS
 struct sc_entry {
 	uint32_t data;
 };
 
 typedef struct sc_entry sc_entry_t;
 
-#define SC_CACHE_FLAGS_SHIFT 8
-#define SC_CACHE_FLAGS_VALID_SHIFT 0
-#define SC_CACHE_FLAGS_DIRTY_SHIFT 1
+#define SC_ENTRY_BLOCK_SHIFT 2
+#define SC_ENTRY_FLAGS_DIRTY_SHIFT 1
+#define SC_ENTRY_FLAGS_VALID_SHIFT 0
 
 
-#define SC_CACHE_VALID(e) (e & (1 << SC_CACHE_FLAGS_VALID_SHIFT))
-#define SC_CACHE_DIRTY(e) (e & (1 << SC_CACHE_FLAGS_DIRTY_SHIFT))
+#define SC_ENTRY_DIRTY(e) (e & (1 << SC_ENTRY_FLAGS_DIRTY_SHIFT))
+#define SC_ENTRY_VALID(e) (e & (1 << SC_ENTRY_FLAGS_VALID_SHIFT))
 
-#define SC_CACHE_BLOCK(e) (e >> SC_CACHE_FLAGS_SHIFT)
-#define SC_CACHE_LBA(e, sb) ((e >> SC_CACHE_FLAGS_SHIFT) << (sb->bitsbsz2sc))
+/*
+ * This is the backing device block
+ */
+#define SC_ENTRY_BLOCK(e) (e >> SC_ENTRY_BLOCK_SHIFT)
+#define SC_ENTRY_LBA(e, sb) ((e >> SC_ENTRY_BLOCK_SHIFT) << (sb->bitsbsz2sc))
+#define SC_ENTRY_CONSTRUCT(bb, d, v) \
+    ((bb << SC_ENTRY_BLOCK_SHIFT) | (d << SC_ENTRY_FLAGS_DIRTY_SHIFT) | v)
 
+struct sc_log {
+	uint32_t data;
+};
+typedef struct sc_log sc_log_t;
+
+#define SC_LOG_OP_MAP_SET 0
+#define SC_LOG_OP_MAP_CLEAN 1
+#define SC_LOG_OP_DIRTY_SET 2
+#define SC_LOG_OP_DIRTY_CLEAN 3
+
+#define SC_LOG_BLOCK_SHIFT 8
+#define SC_LOG_GEN_SHIFT 3
+
+/*
+ * This is the caching device block
+ */
+#define SC_LOG_BLOCK(l) (l >> SC_LOG_BLOCK_SHIFT)
+#define SC_LOG_GEN(l) ((l & ((1 << SC_LOG_BLOCK_SHIFT) - 1)) >> SC_LOG_GEN_SHIFT)
+#define SC_LOG_OPCODE(l) (l & ((1 << SC_LOG_GEN_SHIFT)- 1))
+/*
+ * The block here is the cache device's lba.
+ * We reserve the head part as sb and metadata,
+ * so the block here mustn't be zero.
+ */
+#define SC_LOG_VALID(l) SC_LOG_BLOCK(l)
+
+#define SC_LOG_CONSTRUCT(cb, g, o) \
+    ((cb << SC_LOG_BLOCK_SHIFT) | (g << SC_LOG_GEN_SHIFT) | o)
 
 #define SC_MAGIC_NUMBER 0x53435342
+/*
+ * In-core mapping array
+ * This mapping array is indexed by backing device lba
+ * and saves the caching device lba. This is reverse with
+ * the on-disk mapping.
+ * We use a linear array here which is inefficient in memory,
+ * but we could do lockless search and update.
+ */
+struct sc_cache_entry {
+	unsigned int cb; /* caching device block */
+};
+
+enum sc_log_replay {
+    SC_LOG_REPLAY_NOTHING = 0,
+    SC_LOG_REPLAY_PATCH,
+    SC_LOG_REPLAY_RUN,
+};
+
+typedef void (*log_done_fn_t)(void *);
+
+struct sc_log_item {
+	struct llist_node node;
+	struct sc_log_sb *sl;
+	uint32_t data;
+	uint32_t bb; /* for op set to save bblock */
+	log_done_fn_t log_done;
+	void *private;
+};
+
+#define SL_RUN(sl) (sl->toggle)
+#define SL_PATCH(sl) (sl->toggle ^ 1)
+
+struct sc_log_sb {
+	struct sc_sb *sb;
+	sector_t log_start[2]; /* sectors */
+	sector_t log_offset[2]; /* sectors */
+	sector_t log_len;
+	int toggle;
+	struct page *log_page;
+	struct bio log_bio;
+	int log_page_offset; /* sc_log_t */
+
+	struct llist_head list;
+	struct work_struct insert_work;
+
+	bool patch;
+	struct work_struct patch_work;
+
+	struct block_device *dev;
+	wait_queue_head_t waitq;
+};
+
 /*
  * In-core scache super block
  */
@@ -224,11 +331,18 @@ struct sc_sb {
 	uint8_t 	bitsbsz2sc; /* bits need to shift to convert
 				       from block_size to sector or reverse */
 	sector_t 	bszmask;
-	uint64_t 	mlen; /* Bytes, length of all metadata, sb and mapping,
+	uint64_t 	maplen; /* Bytes, length of all metadata, sb and mapping,
 				 block_size aligned */
-	struct page 	*first_page; /* super block is contained in it */
-	struct page 	**map_pages; /* include the first page */
-	sc_entry_t **mappings;
+	uint8_t 	gen;
+	struct page 	*sb_page; /* super block is contained in it */
+	struct page 	**map_pages; /* on-disk mapping array
+					we keep them in memory just for patching
+					and this looks inefficient */
+	struct sc_cache_entry **mappings; /* in-core mapping array 
+					     we will allocate it page by page,
+					     then it will be easier to get */
+	int 		bmaplen;
+	struct 		sc_log_sb log;
 };
 
 /*
@@ -238,7 +352,8 @@ struct sc_d_sb {
 	__u32 		sc_magic; /* SC_MAGIC_NUMBER */
 	__u64 		csum;
 	__u32 		block_size; /* Bytes */
-	__u64 		mlen; /* Bytes, length of all metadata */
+	__u64 		maplen; /* Bytes, length of mapping array */
+	__u8 		gen; /* generation of mapping entry array */
 };
 
 #endif
