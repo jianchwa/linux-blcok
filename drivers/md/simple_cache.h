@@ -32,6 +32,24 @@ enum sc_cache_mode {
 	SC_CACHE_WRITEBACK,
 };
 
+enum sc_ra_state {
+	SC_RA_READ_BACKING,
+	SC_RA_WRITE_CACHING,
+	SC_RA_LOG,
+	SC_RA_COMPLETE,
+};
+
+struct sc_ra_io {
+	struct sc_cache_info *sci;
+	struct sc_backing_dev *scbd;
+	unsigned long bb, cb;
+	struct page **pages;
+	struct bio *bio;
+	int nr;
+	enum sc_ra_state state;
+	struct work_struct async_work;
+};
+
 /*
  *
  * 63    48 47   32 31           2 1 0
@@ -40,8 +58,12 @@ enum sc_cache_mode {
  * 63:48    last access jiffies
  * 47:32    average access interval
  * 31:2     in-flight IO
- * 1        dirty/clear
- * 0        valid/invalid bit
+ * 1:0 		state
+ *
+ * 0 		invalid
+ * 1 		readahead
+ * 2 		clean
+ * 4 		dirty
  *
  * The max last access jiffies is 2^16 (32K), for a machine with HZ=1000,
  * it is about 32s. This is enougth, because a cache block must have been
@@ -49,18 +71,24 @@ enum sc_cache_mode {
  */
 struct sc_cache_info {
 	uint64_t status;
-	uint64_t block; /* block of backing device */
+	uint64_t bb; /* block of backing device */
+	uint32_t cb;
+	struct llist_head pending_list; /* readahead, dirty log */
+};
+enum sci_state {
+	SCI_READAHEAD = 0,
+	SCI_CLEAN,
+	SCI_DIRTY,
+	SCI_INVALID,
 };
 
-#define SC_CACHE_INFO_VALID(i) (i & 0x1)
-#define SC_CACHE_INFO_DIRTY(i) (i & 0x2)
+#define SC_CACHE_INFO_STATE(i) (i & 0x3)
 #define SC_CACHE_INFO_INFLIGHT(i) ((i & 0xffffffff) >> 2)
 #define SC_CACHE_INFO_LAST(i) (i >> 48)
 #define SC_CACHE_INFO_AVG(i) ((i >> 32) & 0xffff)
-#define SC_CACHE_INFO(l, a, f, d, i) \
+#define SC_CACHE_INFO(l, a, f, s) \
 	(((uint64_t)l << 48) | (((uint64_t)a << 32) & 0xffff) | \
-	 ((f & 0xffffffff) << 2) | \
-	 (d << 1) | i)
+	 ((f & 0xffffffff) << 2) | s)
 
 /*
  * Process of reclaim a cache block
@@ -89,6 +117,10 @@ struct sc_cache_info {
 struct sc_bitmap_slot {
 	unsigned long *map;
 	int hint;
+	/*
+	 * FIXME:
+	 *   Needn't this depth for every slot
+	 */
 	int depth;
 	atomic_t available;
 };
@@ -112,6 +144,7 @@ struct sc_backing_dev {
 	struct sc_cache_info **scis; /* sc_cache_info array */
 	int scis_arrary_len;
 	unsigned long scis_total;
+	unsigned long cb_offset;
 	wait_queue_head_t wait_invalidate;
 
 	struct gendisk *front_disk;
@@ -135,7 +168,10 @@ struct sc_io {
 	struct bio clone;
 	struct sc_backing_dev *scbd;
 	struct bio *front_bio;
+	struct sc_cache_info *sci;
 	int start_time;
+	struct llist_node node; /* for readahead wait */
+	bool started;
 };
 
 struct sc_sysfs_entry {
@@ -215,13 +251,14 @@ struct sc_sysfs_entry {
  */
 
 #define SC_DEFAULT_CACHE_BLOCK_SIZE 131072 /* 128K Bytes */
-#define SC_CACHE_MAPPING_ENTRY_SIZE 4 /* Bytes */
-#define SC_ENTRIES_PER_PAGE (PAGE_SIZE / SC_CACHE_MAPPING_ENTRY_SIZE)
 #define SC_MAPPING_FIRST_PAGE_OFFSET (512 / SC_CACHE_MAPPING_ENTRY_SIZE)
 #define SC_MAPPING_START PAGE_SECTORS
 struct sc_entry {
 	uint32_t data;
 };
+
+#define SC_CACHE_MAPPING_ENTRY_SIZE sizeof(struct sc_entry) /* Bytes */
+#define SC_MAPPING_ENTRIES_PER_PAGE (PAGE_SIZE / SC_CACHE_MAPPING_ENTRY_SIZE)
 
 typedef struct sc_entry sc_entry_t;
 
@@ -246,6 +283,7 @@ struct sc_log {
 };
 typedef struct sc_log sc_log_t;
 
+#define SC_LOG_ENTRIES_PER_PAGE (PAGE_SIZE / sizeof(struct sc_log))
 #define SC_LOG_OP_MAP_SET 0
 #define SC_LOG_OP_MAP_CLEAN 1
 #define SC_LOG_OP_DIRTY_SET 2
@@ -278,10 +316,34 @@ typedef struct sc_log sc_log_t;
  * the on-disk mapping.
  * We use a linear array here which is inefficient in memory,
  * but we could do lockless search and update.
+ *
+ * Most capacity of caching device is 1T
+ * Smallest block size is 64K
+ * So we need 24 bits at most for caching block.
+ *
+ *                cblock
+ *          ________^ _________
+ *         /                   \
+ * |-------|-------------------|
+ * \___ __/
+ *     v
+ *   flags
+ * 31 ~ 24  flags
+ *   31     allocating
+ *
+ * 23 ~ 0   cblock
  */
+#define SC_CACHE_ENTRY_CB_ALLOCATING (1 << 31)
+#define SC_CACHE_ENTRY_ALLOCATING(e) (e & SC_CACHE_ENTRY_CB_ALLOCATING)
+#define SC_CACHE_ENTRY_CB_BITS 24
+#define SC_CACHE_ENTRY_CB(e) (e & ((1 << SC_CACHE_ENTRY_CB_BITS) - 1))
+
 struct sc_cache_entry {
-	unsigned int cb; /* caching device block */
+	uint32_t cb; /* caching device block */
 };
+
+#define SC_CACHE_ENTRY_SIZE sizeof(struct sc_cache_entry)
+#define SC_CACHE_ENTRIES_PER_PAGE (PAGE_SIZE / SC_CACHE_ENTRY_SIZE)
 
 enum sc_log_replay {
     SC_LOG_REPLAY_NOTHING = 0,
@@ -294,8 +356,9 @@ typedef void (*log_done_fn_t)(void *);
 struct sc_log_item {
 	struct llist_node node;
 	struct sc_log_sb *sl;
-	uint32_t data;
-	uint32_t bb; /* for op set to save bblock */
+	uint8_t op;
+	uint32_t cb;
+	uint32_t bb; /* for SET op to save bblock */
 	log_done_fn_t log_done;
 	void *private;
 };
@@ -310,7 +373,6 @@ struct sc_log_sb {
 	sector_t log_len;
 	int toggle;
 	struct page *log_page;
-	struct bio log_bio;
 	int log_page_offset; /* sc_log_t */
 
 	struct llist_head list;
@@ -331,17 +393,21 @@ struct sc_sb {
 	uint8_t 	bitsbsz2sc; /* bits need to shift to convert
 				       from block_size to sector or reverse */
 	sector_t 	bszmask;
+	unsigned long scblkmask;
 	uint64_t 	maplen; /* Bytes, length of all metadata, sb and mapping,
 				 block_size aligned */
-	uint8_t 	gen;
+	uint8_t 	mapping_gen;
+	uint8_t 	run_gen;
+	uint8_t 	patch_gen;
 	struct page 	*sb_page; /* super block is contained in it */
-	struct page 	**map_pages; /* on-disk mapping array
+	struct page 	**map_pages; /* cache of on-disk mapping array
 					we keep them in memory just for patching
 					and this looks inefficient */
 	struct sc_cache_entry **mappings; /* in-core mapping array 
 					     we will allocate it page by page,
 					     then it will be easier to get */
 	int 		bmaplen;
+	int 		max_bb;
 	struct 		sc_log_sb log;
 };
 

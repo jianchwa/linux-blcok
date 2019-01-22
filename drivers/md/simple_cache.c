@@ -28,7 +28,33 @@ static LIST_HEAD(sc_all_backing_dev);
  */
 static struct mutex sc_all_backing_dev_lock;
 
-static unsigned int sc_get_mapping_entry(struct sc_backing_dev *scbd, sector_t sec);
+static char *sc_log_op_strings[] = {
+	"MAP_SET",
+	"MAP_CLEAN",
+	"DIRTY_SET",
+	"DIRTY_CLEAN"
+};
+
+static char *sci_state_strings[] = {
+	"READAHEAD",
+	"CLEAR",
+	"DIRTY",
+	"INVALID"
+};
+
+static char *sc_ra_state_strings[] = {
+	"READ_BACKING",
+	"WRITE_CACHING",
+	"LOG",
+	"COMPLETE"
+};
+
+static int sc_get_mapping_entry(struct sc_backing_dev *scbd, sector_t sec);
+static int sc_block_alloc(struct sc_backing_dev *scbd);
+static blk_qc_t sc_writeback(struct sc_io *sio);
+static void sc_ra_sm(struct sc_ra_io *raio);
+static void sc_log_insert(struct sc_log_item *sli);
+static void sc_cache_complete(struct sc_cache_info *sci);
 
 struct sc_multi_io {
 	atomic_t bios;
@@ -105,6 +131,16 @@ static void sc_wait_for_completion(struct sc_backing_dev *scbd)
 	finish_wait(&scbd->wait_compl, &wait);
 }
 
+static struct sc_cache_info *sc_get_cache_info(struct sc_backing_dev *scbd, int cblock)
+{
+	int sci_per_page = PAGE_SIZE / sizeof(struct sc_cache_info);
+
+	cblock -= scbd->cb_offset;
+	if (cblock > scbd->scis_total)
+		return NULL;
+	return &scbd->scis[cblock/sci_per_page][cblock%sci_per_page];
+}
+
 static struct sc_io *alloc_sc_io(struct sc_backing_dev *scbd, struct bio *bio)
 {
 	struct sc_io *sio;
@@ -128,6 +164,7 @@ static int sc_io_init(struct sc_io *sio)
 {
 	bio_init(&sio->clone, NULL, 0);
 
+	sio->started = false;
 	return 0;
 }
 
@@ -160,23 +197,23 @@ static blk_qc_t sc_passthrough(struct sc_io *sio)
 	return submit_bio(clone);
 }
 
-void sc_writeback_end(struct bio *clone)
+void sc_writeback_endio(struct bio *clone)
 {
 	struct sc_io *sio = clone->bi_private;
-	struct sc_backing_dev *scbd = sio->scbd;
 	struct bio *bio = sio->front_bio;
 
 	sc_end_io_acct(sio);
-
+	/*
+	 * TODO
+	 * - handle the failing case
+	 */
+	sc_cache_complete(sio->sci);
 	bio->bi_status = clone->bi_status;
-	if (!bio->bi_status && op_is_write(bio_op(bio))) {
-
-	}
 	bio_endio(bio);
 	free_sc_io(sio);
 }
 
-static bool sc_cache_clear(struct sc_cache_info *sci)
+static bool sc_cache_clean(struct sc_cache_info *sci)
 {
 	uint64_t new, old;
 
@@ -188,150 +225,560 @@ static bool sc_cache_clear(struct sc_cache_info *sci)
 		new = SC_CACHE_INFO(SC_CACHE_INFO_LAST(old),
 							SC_CACHE_INFO_AVG(old),
 							SC_CACHE_INFO_INFLIGHT(old),
-							0, 1);
+							SCI_CLEAN);
 		old = cmpxchg(&sci->status, old, new);
 		if (old == new)
 			return true;
 	}
 }
 
-static bool sc_cache_invalidate(struct sc_cache_info *sci)
+static bool sc_cache_invalidate(struct sc_sb *sb, struct sc_cache_info *sci)
 {
 	uint64_t new, old;
+	struct sc_cache_entry *entry;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
 		/*
-		 * We can only invalidate clear cache block
+		 * We can only invalidate clean cache block
 		 */
 		if (SC_CACHE_INFO_INFLIGHT(old) ||
-			SC_CACHE_INFO_DIRTY(old))
+			(SC_CACHE_INFO_STATE(old) == SCI_CLEAN))
 			return false;
 
-		new = SC_CACHE_INFO(0, 0, 1, 0, 0);
+		new = SC_CACHE_INFO(0, 0, 0, SCI_INVALID);
 		old = cmpxchg(&sci->status, old, new);
 		if (old == new)
-			return true;
+			break;
+	}
+	entry = sb->mappings[sci->bb / SC_CACHE_ENTRIES_PER_PAGE];
+	entry += (sci->bb % SC_CACHE_ENTRIES_PER_PAGE);
+
+	WRITE_ONCE(entry->cb, 0);
+	return true;
+}
+
+static unsigned long sc_calc_complete(uint64_t old)
+{
+	uint64_t last, avg, inflight;
+	enum sci_state state;
+
+	/*
+	 * Dirty state will be set by sc_dirty_log_done
+	 */
+	state = SC_CACHE_INFO_STATE(old);
+	last = SC_CACHE_INFO_LAST(old);
+	avg = SC_CACHE_INFO_AVG(old);
+	inflight = SC_CACHE_INFO_INFLIGHT(old);
+	inflight--;
+
+	return SC_CACHE_INFO(last, avg, inflight, state);
+}
+
+static void sc_cache_complete(struct sc_cache_info *sci)
+{
+	uint64_t old, new;
+
+	old = READ_ONCE(sci->status);
+
+	if (SC_CACHE_INFO_STATE(old) == SCI_INVALID ||
+		SC_CACHE_INFO_STATE(old) == SCI_READAHEAD) {
+		WARN(1, "Wrong sci state %d\n", (int)SC_CACHE_INFO_STATE(old));
+		return;
+	}
+
+	while (1) {
+		new = sc_calc_complete(old);
+		old = cmpxchg(&sci->status, old, new);
+		if (old == new)
+			break;;
 	}
 }
 
-static unsigned long sc_calc_new(uint64_t old)
+static unsigned long sc_calc_dirty(uint64_t old)
+{
+	uint64_t last, avg, inflight;
+
+	last = SC_CACHE_INFO_LAST(old);
+	avg = SC_CACHE_INFO_AVG(old);
+	inflight = SC_CACHE_INFO_INFLIGHT(old);
+
+	return SC_CACHE_INFO(last, avg, inflight, SCI_DIRTY);
+}
+
+/*
+ * There could be read IO in parallel with us
+ */
+static void sc_cache_dirty(struct sc_cache_info *sci)
+{
+	uint64_t old, new;
+
+	old = READ_ONCE(sci->status);
+
+	WARN_ON(SC_CACHE_INFO_STATE(old) != SCI_CLEAN);
+
+	while (1) {
+		new = sc_calc_dirty(old);
+		old = cmpxchg(&sci->status, old, new);
+		if (old == new)
+			break;;
+	}
+}
+
+static unsigned long sc_calc_start(uint64_t old)
 {
 	uint64_t now, last, avg, inv, inflight;
+	enum sci_state state;
 
 	now = jiffies;
 	last = SC_CACHE_INFO_LAST(old);
 	inv = now - last;
-	inflight = SC_CACHE_INFO_LAST(old);
+	inflight = SC_CACHE_INFO_INFLIGHT(old);
 	avg = SC_CACHE_INFO_AVG(old);
+	state = SC_CACHE_INFO_STATE(old);
 	avg *= 8;
 	avg += inv;
 	avg /= 8;
 	last = now;
 	inflight++;
 
-	return SC_CACHE_INFO(last, avg, inflight, 1, 1);
+	return SC_CACHE_INFO(last, avg, inflight, state);
 }
 
-void sc_wait_invalidate(struct sc_backing_dev *scbd,
-		struct sc_cache_info *sci)
-{
-	wait_event(scbd->wait_invalidate,
-			!SC_CACHE_INFO_INFLIGHT(READ_ONCE(sci->status)));
-}
-
-static bool sc_cache_access(struct sc_backing_dev *scbd,
-		struct sc_cache_info *sci)
+static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started)
 {
 	uint64_t old, new;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
-		if (!SC_CACHE_INFO_VALID(old)) {
-			if (SC_CACHE_INFO_INFLIGHT(old)) {
-				/*
-				 * Before invalidate a cache block, the average of access interval
-				 * and last access time has been checked, so this should not be
-				 * a frequent case.
-				 */
-				pr_info("Accessing a cache block with being invalidated %llx\n",
-						sci->block);
-				sc_wait_invalidate(scbd, sci);
-			}
-			return false;
+		trace_printk("cache start bb %llx %s\n",
+				sci->bb, sci_state_strings[SC_CACHE_INFO_STATE(old)]);
+
+		if (SC_CACHE_INFO_STATE(old) == SCI_INVALID) {
+			pr_info("Accessing a cache block with being invalidated %llx\n",
+					sci->bb);
+			return SCI_INVALID;
 		}
 
 		/*
-		 * dirty and valid bits are set
+		 * cblock under SCI_READAHEAD will not be reclaimed.
 		 */
-		new = sc_calc_new(old);
+		if (SC_CACHE_INFO_STATE(old) == SCI_READAHEAD)
+			return SCI_READAHEAD;
+
+		/*
+		 * sios will re-enter sc_writeback after dirty log, they have been
+		 * accounted as sci in-flight, so needn't account them again.
+		 */
+		if (started)
+			return SC_CACHE_INFO_STATE(old);
+
+		new = sc_calc_start(old);
 		/*
 		 * May race with GC reclaim or concurrent submits and completions.
+		 *
+		 * FIXME:
+		 *   Why does cmpxchg always tries two times even if no one races with
+		 *   it ?
 		 */
 		old = cmpxchg(&sci->status, old, new);
 		/*
 		 * We wins.
 		 */
 		if (old == new)
-			return true;
+			return SC_CACHE_INFO_STATE(old);
 	}
 }
 
-static bool sc_cache_alloc(struct sc_backing_dev *scbd, int block)
+static void sc_handle_pending_list(struct sc_cache_info *sci)
 {
-	/*
-	 * Update the se to indicate we are allocating, then
-	 * others would go to sleep to wait.
-	 *
-	 * So we need a bit that shows allocating.
-	 */
-	return true;
+	struct llist_node *first, *node, *next;
+	struct sc_io *sio;
+
+	first = llist_del_all(&sci->pending_list);
+	if (!first)
+		return;
+
+	llist_for_each_safe(node, next, first){
+		sio = container_of(node, struct sc_io, node);
+		sc_writeback(sio);
+	}
 }
 
+static struct sc_ra_io *sc_alloc_raio(int nr)
+{
+	struct sc_ra_io *raio;
+	int i;
+
+	/*
+	 * FIXME
+	 *   We should consider the failing case.
+	 */
+	raio = kmalloc(sizeof(*raio), GFP_NOIO);
+	raio->pages = kmalloc(sizeof(void *) * nr, GFP_NOIO);
+	for (i = 0; i < nr; i++) {
+		raio->pages[i] = alloc_page(GFP_NOIO);
+		BUG_ON(!raio->pages[i]);
+	}
+	raio->nr = nr;
+
+	return raio;
+}
+
+/*
+ * TODO
+ * sc_ra_io could be cached somewhere
+ */
+static void sc_free_raio(struct sc_ra_io *raio)
+{
+	int i;
+
+	for (i = 0; i < raio->nr; i++)
+		put_page(raio->pages[i]);
+	if (raio->bio)
+		bio_put(raio->bio);
+	kfree(raio->pages);
+	kfree(raio);
+}
+
+static void sc_ra_endio(struct bio *bio)
+{
+	struct sc_ra_io *raio = bio->bi_private;
+
+	queue_work(sc_workqueue, &raio->async_work);
+}
+
+static void sc_ra_write_cache(struct sc_ra_io *raio)
+{
+	struct sc_backing_dev *scbd = raio->scbd;
+	struct bio *bio = raio->bio;
+	int i;
+
+	/*
+	 * Reuse the bio and pages.
+	 */
+	bio = raio->bio;
+	bio_init(bio, bio->bi_io_vec, raio->nr);
+	bio->bi_iter.bi_sector = raio->cb << scbd->sb->bitsbsz2sc;
+	bio_set_dev(bio, scbd->caching_dev);
+	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+	for (i = 0; i < raio->nr; i++)
+		bio_add_page(bio, raio->pages[i], PAGE_SIZE, 0);
+	bio->bi_private = raio;
+	bio->bi_end_io = sc_ra_endio;
+	/*
+	 * Is it OK to submit this in completion context ?
+	 */
+	submit_bio(bio);
+}
+
+/*
+ * kworker task context
+ */
+static void sc_ra_log_done(void *data)
+{
+	sc_ra_sm(data);
+}
+
+static void sc_ra_log(struct sc_ra_io *raio)
+{
+	struct sc_log_item *sli;
+
+	/*
+	 * TODO
+	 *  - mempool or kmem cache
+	 */
+	sli = kmalloc(sizeof(*sli), GFP_NOIO);
+	sli->sl = &raio->scbd->sb->log;
+	sli->op = SC_LOG_OP_MAP_SET;
+	sli->cb = raio->cb;
+	sli->bb = raio->bb;
+	sli->log_done = sc_ra_log_done;
+	sli->private = raio;
+
+	sc_log_insert(sli);
+}
+
+static void sc_ra_complete(struct sc_ra_io *raio)
+{
+	struct sc_cache_info *sci = raio->sci;
+	uint64_t data;
+
+	sci->bb = raio->bb;
+	sci->cb = raio->cb;
+	sc_free_raio(raio);
+	/*
+	 * Setup a clean cache entry after readahead
+	 */
+	data = 	SC_CACHE_INFO(0, 0, 0, SCI_CLEAN);
+	WRITE_ONCE(sci->status, data);
+	smp_mb__before_atomic();
+	sc_handle_pending_list(sci);
+}
+
+static void sc_ra_sm(struct sc_ra_io *raio)
+{
+	trace_printk("ra bb %lx cb %lx %s\n",
+			raio->bb, raio->cb, sc_ra_state_strings[raio->state]);
+	switch (raio->state) {
+	case SC_RA_READ_BACKING:
+		raio->state = SC_RA_WRITE_CACHING;
+		sc_ra_write_cache(raio);
+		break;
+	case SC_RA_WRITE_CACHING:
+		raio->state = SC_RA_LOG;
+		sc_ra_log(raio);
+		break;
+	case SC_RA_LOG:
+		raio->state = SC_RA_COMPLETE;
+		sc_ra_complete(raio);
+		break;
+	default:
+		WARN_ON(1);
+		break;
+	}
+}
+
+/*
+ * Used for irq completion path
+ */
+static void sc_ra_async_work(struct work_struct *work)
+{
+	struct sc_ra_io *raio = container_of(work, struct sc_ra_io, async_work);
+
+	sc_ra_sm(raio);
+}
+
+static void sc_cache_readahead(struct sc_backing_dev *scbd,
+		struct sc_cache_info *sci, unsigned long cb, unsigned long bb)
+{
+	struct sc_sb *sb = scbd->sb;
+	struct bio *bio;
+	struct sc_ra_io *raio;
+	int i;
+
+	if (SC_CACHE_INFO_STATE(READ_ONCE(sci->status)) != SCI_READAHEAD) {
+		/*
+		 * FIXME
+		 *   we should avoid invoke sc_writeback in itself.
+		 */
+		sc_handle_pending_list(sci);
+		return;
+	}
+
+	raio = sc_alloc_raio(sb->block_size / PAGE_SIZE);
+	raio->scbd = scbd;
+	raio->sci = sci;
+	raio->bb = bb;
+	raio->cb = cb;
+	raio->state = SC_RA_READ_BACKING;
+	INIT_WORK(&raio->async_work, sc_ra_async_work);
+	/*
+	 * Our max block size is 512K which needs 128 vecs
+	 * The max bio vecs is 256.
+	 * TODO
+	 * - we need a mempool of ourself 
+	 */
+	bio = bio_alloc(GFP_NOIO, raio->nr);
+	bio->bi_iter.bi_sector = bb << sb->bitsbsz2sc;
+	bio_set_dev(bio, scbd->backing_dev);
+	bio_set_op_attrs(bio, REQ_OP_READ, 0);
+	for (i = 0; i < raio->nr; i++)
+		bio_add_page(bio, raio->pages[i], PAGE_SIZE, 0);
+	bio->bi_private = raio;
+	bio->bi_end_io = sc_ra_endio;
+	raio->bio = bio;
+
+	submit_bio(bio);
+
+	return;
+}
+
+static void sc_dirty_log_done(void *data)
+{
+	struct sc_cache_info *sci = data;
+
+	sc_cache_dirty(sci);
+	sc_handle_pending_list(sci);
+}
+
+static void sc_dirty_log(struct sc_cache_info *sci, struct sc_backing_dev *scbd)
+{
+	struct sc_log_item *sli;
+
+	/*
+	 * TODO
+	 *  - mempool or kmem cache
+	 */
+	sli = kmalloc(sizeof(*sli), GFP_NOIO);
+	sli->sl = &scbd->sb->log;
+	sli->op = SC_LOG_OP_DIRTY_SET;
+	sli->cb = sci->cb;
+	sli->bb = ~0; /* Invalid value */
+	sli->log_done = sc_dirty_log_done;
+	sli->private = sci;
+
+	sc_log_insert(sli);
+}
+
+/*
+ * How to handle cache miss
+ *
+ * 1. mark allocating (winner need to be responsible for allocation)
+ * 2. allocate cblock
+ * 3. readahead
+ * 4. insert log
+ * 5. update in-core mapping
+ */
 static blk_qc_t sc_writeback(struct sc_io *sio)
 {
 	struct sc_backing_dev *scbd = sio->scbd;
 	struct sc_sb *sb = scbd->sb;
-	struct bio *clone = &sio->clone;
 	struct bio *bio = sio->front_bio;
+	struct bio *clone = &sio->clone;
 	sector_t offset = bio->bi_iter.bi_sector;
-	unsigned int cblock;
+	/*
+	 * FIXME:
+	 *   the cblock unit is not consistent across the code,
+	 *   some are 'int', some are 'unsigned long'.
+	 */
+	int cblock;
+	struct sc_cache_info *sci;
+	blk_qc_t ret = BLK_QC_T_NONE;
 
-	cblock = sc_get_mapping_entry(scbd, offset);
-	if (cblock) {
-	
-		/*
-		 * Cache hit, write to cache directly
-		 */
-		__bio_clone_fast(clone, bio);
-#if 0
-		clone->bi_iter.bi_sector =
-			SC_CACHE_LBA(READ_ONCE(e->data), sb) + (offset - (offset & sb->bszmask));
-#endif
-		bio_set_dev(clone, scbd->caching_dev);
-		//clone->bi_end_io = sio_writeback_end;
-		clone->bi_private = sio;
-		submit_bio(clone);
+	if ((bio->bi_iter.bi_sector >> sb->bitsbsz2sc) !=
+			((bio_end_sector(bio) - 1) >> sb->bitsbsz2sc)) {
+		pr_warn("Single bio spans two blocks, bio %lx - %lx\n",
+				bio->bi_iter.bi_sector, bio_end_sector(bio));
 	}
-	return BLK_QC_T_NONE;
+
+retry:
+	cblock = sc_get_mapping_entry(scbd, offset);
+	if (cblock <= 0) {
+		/* 1. last part which is smaller than block size
+		 * 2. no cache space currently
+		 *    FIXME:
+		 *      This is not a good way.
+		 *      Please refer to comments in SCI_READAHEAD case
+		 */
+		pr_warn("passthrough\n");
+		goto passthrough;
+	}
+
+	sci = sc_get_cache_info(scbd, cblock);
+	if (!sci) {
+		pr_err("NULL sci for cb %x off%lx\n", cblock, offset);
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return BLK_QC_T_NONE;
+	}
+
+	switch (sc_cache_start(sci, sio->started)) {
+	case SCI_INVALID:
+		goto retry;
+	case SCI_READAHEAD:
+		/*
+		 * trigger readahead
+		 * the other IOs on the same block should wait for the readahead,
+		 * otherwise, the readahead block maybe different from the one on
+		 * backing device.
+		 */
+		if (llist_add(&sio->node, &sci->pending_list)) {
+			smp_mb__after_atomic();
+			sc_cache_readahead(scbd, sci, cblock, offset >> sb->bitsbsz2sc);
+		}
+		break;
+	case SCI_CLEAN:
+		/*
+		 * For write, we need to send out dirty log.
+		 */
+		if (op_is_write(bio_op(bio))) {
+			sio->started = true;
+			if (llist_add(&sio->node, &sci->pending_list))
+				sc_dirty_log(sci, scbd);
+			break;
+		}
+		/*
+		 * fallthrougth for read
+		 */
+	default:
+		/*
+		 * cache hit
+		 */
+		sio->started = true;
+		sio->sci = sci;
+		__bio_clone_fast(clone, bio);
+		clone->bi_iter.bi_sector = (cblock << sb->bitsbsz2sc) + (offset & sb->scblkmask);
+		trace_printk("cache hit IO ca %lx ba %lx\n", clone->bi_iter.bi_sector, offset);
+		bio_set_dev(clone, scbd->caching_dev);
+		clone->bi_end_io = sc_writeback_endio;
+		clone->bi_private = sio;
+
+		ret = submit_bio(clone);
+		break;
+	}
+
+	return ret;
+
+passthrough:
+	/*
+	 * We passthrough cache when cache miss first time, and bless followings
+	 * But I have to concern that the passthrough IO to backing device would
+	 * slow down the readahead IO.
+	 */
+	return sc_passthrough(sio);
 }
 
-static blk_qc_t sc_make_request(struct request_queue *q, struct bio *bio)
+static struct bio *sc_bio_split(struct sc_backing_dev *scbd, struct bio *bio)
 {
-	struct sc_backing_dev *scbd = q->queuedata;
-	struct sc_io *sio;
-	blk_qc_t ret;
+	struct sc_sb *sb = scbd->sb;
+	struct bio_vec bv;
+	struct bvec_iter iter;
+	sector_t start = bio->bi_iter.bi_sector;
+	sector_t sectors = 0;
+	struct bio *new;
 
-	/*
-	 * split the bio based on the cache mapping block size,
-	 * then we will only have cache hit or miss cases and don't
-	 * need to consider cache hit/miss partially.
-	 */
-	blk_queue_split(q, &bio);
+	bio_for_each_segment(bv, bio, iter) {
+		sectors += (bv.bv_len >> 9);
+		if ((start >> sb->bitsbsz2sc) !=
+				((start + sectors) >> sb->bitsbsz2sc)) {
+			/*
+			 *     split
+			 *  _____^_____
+			 * /           \|
+			 * |------| |---|--| |------|
+			 *              |
+			 *         block boundary
+			 */
+			sectors = ((start + sectors) & (~sb->scblkmask)) - start;
+			if (sectors != bio_sectors(bio))
+				goto split;
+		}
+
+		/* FIXME
+		 * There are some codes about seg_size in blk_queue_split.
+		 * We need to backport them here.
+		 */
+	}
+
+	return bio;
+split:
+	trace_printk("split bio %lx len %x at %lx\n",
+			bio->bi_iter.bi_sector, bio_sectors(bio), sectors);
+	new = bio_split(bio, sectors, GFP_NOIO, scbd->front_queue->bio_split);
+	new->bi_opf |= REQ_NOMERGE;
+	bio_chain(new, bio);
+	generic_make_request(bio);
+	return new;
+}
+
+static struct sc_io *sc_setup_io(struct sc_backing_dev *scbd, struct bio *bio)
+{
+	struct sc_io *sio;
 
 	sio = alloc_sc_io(scbd, bio);
 	if (unlikely(!sio))
-		return BLK_QC_T_NONE;
+		return NULL;
 
 	sc_io_init(sio);
 	/*
@@ -340,13 +787,34 @@ static blk_qc_t sc_make_request(struct request_queue *q, struct bio *bio)
 	sio->front_bio = bio;
 
 	sc_start_io_acct(sio);
+
+	return sio;
+}
+
+static blk_qc_t sc_make_request(struct request_queue *q, struct bio *bio)
+{
+	struct sc_backing_dev *scbd = q->queuedata;
+	struct sc_io *sio;
+	blk_qc_t ret;
+
 	switch(READ_ONCE(scbd->mode)) {
-	case SC_CACHE_PASSTHROUGH:
-		ret = sc_passthrough(sio);
-		break;
 	case SC_CACHE_WRITETHROUGH:
 	case SC_CACHE_WRITEBACK:
-		ret = BLK_QC_T_NONE;
+		if (bio_sectors(bio)) {
+			/*
+			 * split the bio based on the cache mapping block alignment,
+			 * then we will only have cache hit or miss cases and don't
+			 * need to consider cache hit/miss partially.
+			 */
+			bio = sc_bio_split(scbd, bio);
+			sio = sc_setup_io(scbd, bio);
+			ret = sc_writeback(sio);
+			break;
+		}
+		/* fallthrougth if no data */
+	case SC_CACHE_PASSTHROUGH:
+		sio = sc_setup_io(scbd, bio);
+		ret = sc_passthrough(sio);
 		break;
 	default:
 		BUG();
@@ -444,7 +912,7 @@ static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, i
 
 	for (i = 0; i < nr; i++) {
 		start = (sc_log_t *)page_address(pages[i]);
-		end = start + SC_ENTRIES_PER_PAGE;
+		end = start + SC_LOG_ENTRIES_PER_PAGE;
 		for (; start < end; start++) {
 			data = READ_ONCE(start->data);
 			if (!SC_LOG_VALID(data)) {
@@ -460,7 +928,7 @@ static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, i
 				goto out;
 			}
 
-			if (SC_LOG_GEN(data) <= sb->gen) {
+			if (SC_LOG_GEN(data) <= sb->mapping_gen) {
 				/*
 				 * run   patch
 				 * +--+  +--+
@@ -478,8 +946,8 @@ static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, i
 				goto out;
 			}
 			cblock = SC_LOG_BLOCK(data);
-			e = (sc_entry_t *)page_address(sb->map_pages[cblock/SC_ENTRIES_PER_PAGE]);
-			e += cblock % SC_ENTRIES_PER_PAGE;
+			e = (sc_entry_t *)page_address(sb->map_pages[cblock/SC_MAPPING_ENTRIES_PER_PAGE]);
+			e += cblock % SC_MAPPING_ENTRIES_PER_PAGE;
 			switch(SC_LOG_OPCODE(data)) {
 			case SC_LOG_OP_MAP_SET:
 				/*
@@ -503,21 +971,27 @@ static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, i
 			}
 		}
 	}
-	return 0;
+	return nr * SC_LOG_ENTRIES_PER_PAGE;
 out:
-	return (i * SC_ENTRIES_PER_PAGE) + (start - (sc_log_t *)page_address(pages[i]));
+	return (i * SC_LOG_ENTRIES_PER_PAGE) + (start - (sc_log_t *)page_address(pages[i]));
 }
 
+/*
+ * Read in run or patch log and apply them on cache pages of on-disk
+ * mapping entries (sc_sb.map_pages[]). It will return the number of
+ * log entries applied.
+ */
 static unsigned long sc_patch_mapping(struct sc_log_sb *sl, int n)
 {
  	int i, nr = sl->sb->block_size / PAGE_SIZE;
 	sector_t start = sl->log_start[n];
+	sector_t end = start + sl->log_len;
 	struct page **pages;
 	struct bio *bio;
-	unsigned long pass, ret;
+	unsigned long ret, pass = 0;
 
 	pages = kzalloc(sizeof(void *) * nr, GFP_NOIO);
-	BUG_ON(pages);
+	BUG_ON(!pages);
 
 	for (i = 0; i < nr; i++) {
 		pages[i] = alloc_page(GFP_NOIO);
@@ -543,18 +1017,21 @@ repeat:
 	WARN_ON(submit_bio_wait(bio));
 
 	ret = __sc_patch_mapping(sl->sb, pages, nr);
-	
+	pr_info("start %lx has %lx valid entries\n", start, ret);
 	bio_put(bio);
-	if (ret) {
-		pass = ((start - sl->log_start[n]) << 9) / SC_CACHE_MAPPING_ENTRY_SIZE;
+	/*
+	 * Stop halfway means there are invalid or time out
+	 * log entries.
+	 */
+	if (ret < (nr * SC_LOG_ENTRIES_PER_PAGE))
 		return pass + ret;
-	}
 
 	start += PAGE_SECTORS * nr;
-	if (start < sl->log_len)
+	pass += nr * SC_LOG_ENTRIES_PER_PAGE;
+	if (start < end)
 		goto repeat;
 
-	return 0;
+	return pass;
 }
 
 /*
@@ -575,11 +1052,15 @@ static void sc_log_patch_work(struct work_struct *work)
 
 	BUG_ON(sl->log_offset[SL_PATCH(sl)] != sl->log_len);
 
+	/*
+	 * Read in logs and apply them.
+	 */
 	if (sl->patch)
 		sc_patch_mapping(sl, SL_PATCH(sl));
 	/*
-	 * This is for the sc_log_replay_patch which wants to patch the mapping
-	 * itself and do other things asynchronously.
+	 * This is for the sc_log_replay_patch.
+	 * It has applied the patch log with sc_patch_mapping and
+	 * just wants to flush patched in-core mappings to disk.
 	 */
 	sl->patch = true;
 	/*
@@ -615,9 +1096,9 @@ static void sc_log_patch_work(struct work_struct *work)
 	/*
 	 * Update the sb patch version
 	 */
-	sb->gen++;
 	sdb = page_address(sb->sb_page);
-	sdb->gen = sb->gen;
+	pr_info("sb gen update from %d to %d\n", sdb->gen, sb->patch_gen);
+	sdb->gen = sb->patch_gen;
 	bio = bio_alloc(GFP_NOIO, 1);
 	bio->bi_iter.bi_sector = 0;
 	bio_set_dev(bio, sl->dev);
@@ -636,45 +1117,59 @@ static void sc_log_patch_work(struct work_struct *work)
 static void sc_log_insert_work(struct work_struct *work)
 {
 	struct sc_log_sb *sl = container_of(work, struct sc_log_sb, insert_work);
+	struct sc_sb *sb = sl->sb;
 	uint32_t *addr = page_address(sl->log_page);
 	int offset = sl->log_page_offset;
-	struct llist_node *first, *node, *stop;
+	struct llist_node *first, *node, *stop, *next;
 	struct sc_log_item *sli;
-	struct bio *bio = &sl->log_bio;
+	struct bio *bio;
 
+	BUG_ON(offset >= (PAGE_SIZE/SC_CACHE_MAPPING_ENTRY_SIZE));
 	first = llist_del_all(&sl->list);
 repeat:
 	if (!first)
 		return;
 	stop = NULL;
-	llist_for_each(node, first){
+	/*
+	 * FIXME:
+	 *   the list is newest to oldest, we should traverse it in reverse odler
+	 */
+	llist_for_each_safe(node, next, first){
+
 		sli = container_of(node, struct sc_log_item, node);
+		trace_printk("bb %x cb %x op %s offset %x run gen %d\n",
+			sli->bb, sli->cb,
+			sc_log_op_strings[sli->op],
+			offset,
+			sb->run_gen);
 		/*
 		 * The previous log entries will be overwritten.
 		 */
-		addr[offset] = sli->data;
+		addr[offset] = SC_LOG_CONSTRUCT(sli->cb, sb->run_gen, sli->op);
 		offset++; /* so the offset's unit is uint32_t */
-		if (SC_LOG_OPCODE(sli->data) == SC_LOG_OP_MAP_SET) {
+		if (sli->op == SC_LOG_OP_MAP_SET) {
 			addr[offset] = sli->bb;
 			offset++;
 		}
-		if (offset >= SC_ENTRIES_PER_PAGE) {
+		if (offset >= SC_LOG_ENTRIES_PER_PAGE) {
 			stop = node;
 			offset = 0;
 			break;
 		}
 	}
 	sl->log_page_offset = offset;
-	bio_init(bio, bio->bi_inline_vecs, 1);
+	bio = bio_alloc(GFP_NOIO, 1);
 	bio->bi_iter.bi_sector = sl->log_offset[SL_RUN(sl)] + sl->log_start[SL_RUN(sl)];
 	bio_set_dev(bio, sl->dev);
 	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_FUA | REQ_META);
 	bio_add_page(bio, sl->log_page, PAGE_SIZE, 0);
 	WARN_ON(submit_bio_wait(bio));
-	
-	llist_for_each(node, first){
+	bio_put(bio);
+
+	llist_for_each_safe(node, next, first){
 		sli = container_of(node, struct sc_log_item, node);
 		sli->log_done(sli->private);
+		kfree(sli);
 		if (node == stop)
 			break;
 	}
@@ -691,9 +1186,15 @@ repeat:
 			wait_event(sl->waitq,
 				(!READ_ONCE(sl->log_offset[SL_PATCH(sl)])));
 			sl->toggle ^= 1;
+			sb->patch_gen = sb->run_gen;
+			/*
+			 * skip 0 if overflow.
+			 */
+			sb->run_gen = (sb->run_gen == 0xff) ? 1 : (sb->run_gen + 1);
+			pr_info("run log gen update to %d\n", sb->run_gen);
 			queue_work(sc_workqueue, &sl->patch_work);
 		}
-		first = stop->next;
+		first = next;
 		goto repeat;
 	}
 }
@@ -704,8 +1205,12 @@ static void sc_log_insert(struct sc_log_item *sli)
 	/*
 	 * If the first one, queue the work
 	 */
-	if (llist_add(&sli->node, &sl->list))
+	trace_printk("insert log bb %x cb %x op %s\n",
+			sli->bb, sli->cb, sc_log_op_strings[sli->op]);
+	if (llist_add(&sli->node, &sl->list)) {
 		queue_work(sc_workqueue, &sl->insert_work);
+		trace_printk("queue insert work\n");
+	}
 }
 
 static void sc_block_wait(struct sc_backing_dev *scbd)
@@ -720,6 +1225,7 @@ static void sc_block_wait(struct sc_backing_dev *scbd)
 	}
 	finish_wait(&scbd->wait_block, &wait);
 }
+
 /*
  * This is a very special interface which can only be invoked
  * by sc_setup_cache before writeabck mode starts. Nobody would
@@ -731,13 +1237,17 @@ static void sc_block_wait(struct sc_backing_dev *scbd)
 static void sc_block_set(struct sc_backing_dev *scbd, int block)
 {
 	int depth = scbd->slots[0].depth;
-	int i = block / depth;
-	unsigned long *map = scbd->slots[i].map;
-	int nr = block % depth;
+	int i, nr;
+	unsigned long *map;
+
+	block -= scbd->cb_offset;
+	i = block / depth;
+	map = scbd->slots[i].map;
+	nr = block % depth;
 
 	set_bit(nr % BITS_PER_LONG, &map[nr / BITS_PER_LONG]);
 	if (!atomic_dec_return(&scbd->slots[i].available))
-		clear_bit(i, &scbd->slot_available);
+		set_bit(i, &scbd->slot_available);
 }
 
 /*
@@ -748,18 +1258,20 @@ static void sc_block_set(struct sc_backing_dev *scbd, int block)
  */
 static int sc_block_alloc(struct sc_backing_dev *scbd)
 {
-	int slot, nr, depth;
+	int slot, nr, depth, ret;
 	unsigned long *map;
 
 retry:
 	slot = find_next_zero_bit(&scbd->slot_available, BITS_PER_LONG, 0);
 	if (slot >= BITS_PER_LONG) {
-		sc_block_wait(scbd);
-		goto retry;
+		return -1;
 	}
 
 	smp_mb__before_atomic();
-	if (!atomic_add_unless(&scbd->slots[slot].available, -1, 0))
+	ret = __atomic_add_unless(&scbd->slots[slot].available, -1, 0);
+	if (ret == 1)
+		set_bit(slot, &scbd->slot_available);
+	else if (ret == 0)
 		goto retry;
 
 	/*
@@ -767,7 +1279,12 @@ retry:
 	 */
 	smp_mb__after_atomic();
 	map = scbd->slots[slot].map;
-	depth = scbd->slots[slot].depth;
+	/*
+	 * 0 ~ (SC_MAX_BITMAP_SLOTS - 1) has the same depth
+	 * and we never uses the last slot's depth when calculate the final
+	 * cblock.
+	 */
+	depth = scbd->slots[0].depth;
 	while (1) {
 		/*
 		 * find_next_zero_bit support array, but test_and_set_bit not.
@@ -780,15 +1297,19 @@ retry:
 			break;
 	}
 
-	return slot * depth + nr;
+	return slot * depth + nr + scbd->cb_offset;
 }
 
 static void sc_block_free(struct sc_backing_dev *scbd, int block)
 {
 	int depth = scbd->slots[0].depth;
-	int i = block / depth;
-	unsigned long *map = scbd->slots[i].map;
-	int nr = block % depth;
+	int i, nr;
+	unsigned long *map;
+
+	block -= scbd->cb_offset;
+	i = block / depth;
+	map = scbd->slots[i].map;
+	nr = block % depth;
 
 	clear_bit(nr % BITS_PER_LONG, &map[nr / BITS_PER_LONG]);
 	/*
@@ -801,33 +1322,28 @@ static void sc_block_free(struct sc_backing_dev *scbd, int block)
 		 * the slot_available.
 		 */
 		smp_mb__before_atomic();
-		set_bit(i, &scbd->slot_available);
+		clear_bit(i, &scbd->slot_available);
 	}
 
 	if (waitqueue_active(&scbd->wait_block))
 		wake_up(&scbd->wait_block);
 }
 
-static struct sc_cache_info *sc_get_cache_info(struct sc_backing_dev *scbd, int cblock)
-{
-	int sci_per_page = PAGE_SIZE / sizeof(struct sc_cache_info);
-
-	if (cblock > scbd->scis_total)
-		return NULL;
-	return &scbd->scis[cblock/sci_per_page][cblock%sci_per_page];
-}
-
-
 static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 {
 	int i;
 	struct sc_sb *sb = scbd->sb;
-	uint64_t depth, slot, len;
+	uint64_t depth, slot, len, mt_to;
 	int sci_per_page;
 	sector_t caching_size = part_nr_sects_read(scbd->caching_dev->bd_part);
 
+	mt_to = (3 * sb->maplen) + PAGE_SIZE;
+	mt_to = round_up(mt_to, sb->block_size);
+	scbd->cb_offset = mt_to / sb->block_size;
+
+	pr_info("First available cb is %lx\n", scbd->cb_offset);
 	depth = round_down((caching_size << 9), sb->block_size);
-	depth -= round_up(sb->maplen, sb->block_size);
+	depth -= mt_to;
 	depth /= sb->block_size;
 
 	scbd->scis_total = depth;
@@ -860,7 +1376,7 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 	pr_info("blocks per slot is %lld\n", slot);
 
 	slot = round_up(slot, BITS_PER_LONG);
-	slot /= BITS_PER_LONG;
+	slot /= 8;
 	for (i = 0; i < SC_MAX_BITMAP_SLOTS - 1; i++) {
 		scbd->slots[i].map = kzalloc(slot, GFP_KERNEL);
 		BUG_ON(!scbd->slots[i].map);
@@ -874,7 +1390,7 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 	pr_info("blocks of last slot is %lld\n", slot);
 
 	slot = round_up(slot, BITS_PER_LONG);
-	slot /= BITS_PER_LONG;
+	slot /= 8;
 	scbd->slots[SC_MAX_BITMAP_SLOTS - 1].map = kzalloc(slot, GFP_KERNEL);
 	BUG_ON(!scbd->slots[SC_MAX_BITMAP_SLOTS - 1].map);
 
@@ -915,7 +1431,6 @@ static int sc_cache_format(struct sc_backing_dev *scbd,
 
 	pr_info("caching capacity is %lu G Bytes maplen %lu K Bytes\n",
 			(unsigned long)(caching_size << 9) >> 30, (unsigned long)maplen >> 10);
-	pr_info("first available block is %llx\n", round_up(total, block_size) >> 9);
 
 	offset = 0;
 	end = total >> 9;
@@ -938,7 +1453,7 @@ static int sc_cache_format(struct sc_backing_dev *scbd,
 	dsb->sc_magic = cpu_to_le32(SC_MAGIC_NUMBER);
 	dsb->block_size = cpu_to_le32(block_size);
 	dsb->maplen = cpu_to_le64(maplen);
-	dsb->gen = 0;
+	dsb->gen = 0; /* invalid gen indicates invalid mapping */
 
 	bio_init(bio, bio->bi_inline_vecs, 1);
 	bio->bi_iter.bi_sector = 0;
@@ -1001,8 +1516,8 @@ static int sc_get_sb(struct sc_backing_dev *scbd)
 	sb->block_size = le32_to_cpu(dsb->block_size);
 	sb->bitsbsz2sc = ilog2(sb->block_size) - 9;
 	sb->maplen = le64_to_cpu(dsb->maplen);
-	sb->gen = dsb->gen; /* 8bits needn't convert */
-	pr_info("sb gen %d\n", sb->gen);
+	sb->mapping_gen = dsb->gen; /* 8bits needn't convert */
+	sb->scblkmask = (1 << sb->bitsbsz2sc) - 1;
 	sb->sb_page = page;
 	scbd->sb = sb;
 
@@ -1022,18 +1537,61 @@ static void sc_put_sb(struct sc_backing_dev *scbd)
 	kfree(sb);
 }
 
-static unsigned int sc_get_mapping_entry(
+static int sc_get_mapping_entry(
 	struct sc_backing_dev *scbd, sector_t sec)
 {
 	struct sc_sb *sb = scbd->sb;
 	int block = sec >> sb->bitsbsz2sc;
 	struct sc_cache_entry *entry;
+	uint32_t data;
+	int cb;
 
-	entry = sb->mappings[block / SC_ENTRIES_PER_PAGE];
+	/*
+	 * This is to handle the last part of backing_dev
+	 * which is smaller than block size.
+	 */
+	if (unlikely(block >= sb->max_bb))
+		return -1;
 
-	entry += (block % SC_ENTRIES_PER_PAGE);
+	entry = sb->mappings[block / SC_CACHE_ENTRIES_PER_PAGE];
+	entry += (block % SC_CACHE_ENTRIES_PER_PAGE);
+retry:
+	data = READ_ONCE(entry->cb);
+	trace_printk("get cb %x %p\n", data, current);
+	if (SC_CACHE_ENTRY_CB(data))
+		return SC_CACHE_ENTRY_CB(data);
 
-	return entry->cb;
+	if (SC_CACHE_ENTRY_ALLOCATING(data))
+		goto spin;
+
+	/*
+	 * There could be multiple tasks encounter cache miss on
+	 * the same block. Only let the winner do the allocation
+	 * and others spin.
+	 */
+	if (cmpxchg(&entry->cb, data, SC_CACHE_ENTRY_CB_ALLOCATING) != data)
+		goto retry;
+
+	cb = sc_block_alloc(scbd);
+	trace_printk("alloc cb %x %p\n", cb, current);
+	if (cb < 0)
+		data = 0;
+	else
+		data = cb;
+	WRITE_ONCE(entry->cb, data);
+
+	return cb;
+spin:
+	/*
+	 * FIXME
+	 *   I need a better way to wait the allocation completes
+	 */
+	preempt_disable();
+	while (SC_CACHE_ENTRY_ALLOCATING(READ_ONCE(entry->cb))) {
+		cpu_relax();
+	}
+	preempt_enable();
+	goto retry;
 }
 
 static int sc_read_mapping(struct sc_backing_dev *scbd)
@@ -1085,8 +1643,8 @@ static inline void sc_cache_entry_set(struct sc_sb *sb,
 {
 	struct sc_cache_entry *entry;
 
-	entry = sb->mappings[bblock / SC_ENTRIES_PER_PAGE];
-	entry += bblock % SC_ENTRIES_PER_PAGE;
+	entry = sb->mappings[bblock / SC_CACHE_ENTRIES_PER_PAGE];
+	entry += bblock % SC_CACHE_ENTRIES_PER_PAGE;
 	entry->cb = cblock;
 }
 
@@ -1097,8 +1655,8 @@ static int sc_handle_mapping_early(struct sc_backing_dev *scbd)
 	sc_entry_t *start, *end;
 	struct sc_cache_info *sci;
 	unsigned long cblock, bblock;
-	bool dirty;
 	uint32_t data;
+	enum sci_state state;
 
 	/*
 	 * Pick the used blocks out of block allocator.
@@ -1106,7 +1664,7 @@ static int sc_handle_mapping_early(struct sc_backing_dev *scbd)
 	cblock = 0;
 	for (i = 0; i < len; i++) {
 		start = page_address(sb->map_pages[i]);
-		end = start + SC_ENTRIES_PER_PAGE;
+		end = start + SC_MAPPING_ENTRIES_PER_PAGE;
 		for (; start < end; start++) {
 			data = READ_ONCE(start->data);
 			if (SC_ENTRY_VALID(data)) {
@@ -1115,15 +1673,15 @@ static int sc_handle_mapping_early(struct sc_backing_dev *scbd)
 					pr_err("mapping entry is corrupted, bb %lx\n", bblock);
 					continue;
 				}
-				dirty = SC_ENTRY_DIRTY(data);
 				sc_block_set(scbd, cblock);
 				sci = sc_get_cache_info(scbd, cblock);
 				if (!sci) {
 					pr_warn("Failed to get sci when handle mapping early %lx\n", cblock);
 					continue;
 				}
-				sci->status = SC_CACHE_INFO(0, 0, 0, dirty, 1); /* valid entry */
-				sci->block = bblock; /* reverse mapping */
+				state = SC_ENTRY_DIRTY(data) ? SCI_DIRTY:SCI_CLEAN;
+				sci->status = SC_CACHE_INFO(0, 0, 0, state);
+				sci->bb = bblock; /* reverse mapping */
 				sc_cache_entry_set(sb, bblock, cblock);
 			}
 			cblock++;
@@ -1157,7 +1715,15 @@ static int sc_setup_mapping(struct sc_backing_dev *scbd)
 		}
 	}
 	pr_info("%ld pages for mapping on disk\n", clen);
-	blen = (backing_size << 9) / sb->block_size;
+
+	/*
+	 * We will passthrough the last unaligned blocks.
+	 */
+	blen = (backing_size << 9);
+	blen = round_down(blen, sb->block_size);
+	blen /= sb->block_size;
+	sb->max_bb = blen;
+
 	blen *= SC_CACHE_MAPPING_ENTRY_SIZE;
 
 	pr_info("Backing device capacity %ld G in-core mapping %ld K\n",
@@ -1168,7 +1734,7 @@ static int sc_setup_mapping(struct sc_backing_dev *scbd)
 	 */
 	blen /= PAGE_SIZE;
 	blen += 1;
-	pr_info("%d 4K memory for mapping in-core\n", blen);
+	pr_info("%ld 4K memory for mapping in-core\n", blen);
 	sb->mappings = kzalloc(sizeof(void *) * blen, GFP_KERNEL);
 	if (!sb->mappings) {
 		pr_err("Failed to allocate mappings\n");
@@ -1251,6 +1817,18 @@ static void sc_log_replay_patch(struct sc_log_sb *sl, int n)
 
 	queue_work(sc_workqueue, &sl->patch_work);
 }
+static void sc_readahead_log_page(struct sc_log_sb *sl)
+{
+	struct bio *bio;
+
+	bio = bio_alloc(GFP_KERNEL, 1);
+	bio->bi_iter.bi_sector = sl->log_offset[SL_RUN(sl)] + sl->log_start[SL_RUN(sl)];
+	bio_set_dev(bio, sl->dev);
+	bio_set_op_attrs(bio, REQ_OP_READ, REQ_META | REQ_SYNC);
+	bio_add_page(bio, sl->log_page, PAGE_SIZE, 0);
+	WARN_ON(submit_bio_wait(bio));
+	bio_put(bio);
+}
 
 static void sc_log_replay_run(struct sc_log_sb *sl, int n)
 {
@@ -1259,8 +1837,11 @@ static void sc_log_replay_run(struct sc_log_sb *sl, int n)
 	sl->toggle = n; /* toggle is running */
 
 	ret = sc_patch_mapping(sl, n);
-	sl->log_offset[SL_RUN(sl)] = (ret / SC_ENTRIES_PER_PAGE) * PAGE_SECTORS;
-	sl->log_page_offset = ret & (~SC_ENTRIES_PER_PAGE);
+	sl->log_offset[SL_RUN(sl)] = (ret / SC_LOG_ENTRIES_PER_PAGE) * PAGE_SECTORS;
+	sl->log_page_offset = ret & (SC_LOG_ENTRIES_PER_PAGE - 1);
+	sc_readahead_log_page(sl);
+	pr_info("run log %d total %ld offset %lx log page offset %x\n",
+			n, ret, sl->log_offset[SL_RUN(sl)], sl->log_page_offset);
 }
 
 /*
@@ -1281,8 +1862,8 @@ static void sc_log_replay_run(struct sc_log_sb *sl, int n)
  * What we need to do here is:
  * 1. get the version of the two log and figure out the running
  *    and patching one through the first log entry's gen number
- * 2. patch the logs of which version is bigger than sb->gen on in-core mapping
- * 3. set the log with version sb->gen + 1 as patching log, and another as
+ * 2. patch the logs of which version is bigger than sb->mapping_gen on in-core mapping
+ * 3. set the log with version sb->mapping_gen + 1 as patching log, and another as
  *    running one.
  * 4. figure out the postion we start to log in the running log
  */
@@ -1294,32 +1875,52 @@ static int sc_replay_log(struct sc_backing_dev *scbd)
 
 	sc_get_log_gen(sl, gen);
 
-	pr_info("log 0 gen %d log 1 gen %d sb gen %d\n", gen[0], gen[1], sb->gen);
+	pr_info("log 0 gen %d log 1 gen %d sb mapping gen %d\n", gen[0], gen[1], sb->mapping_gen);
 
-	if (gen[0] <= sb->gen && gen[1] <= sb->gen)
+	/*
+	 * Invalid gen number in log, so there is not any mapping in log space.
+	 * This is the initial state.
+	 */
+	if (gen[0] == 0 && gen[1] == 0) {
+		/*
+		 * First valid gen number is 1
+		 */
+		sb->run_gen = 1;
 		return 0;
+	}
+	/*
+	 * FIXME:
+	 *   Need to handle the overflow case.
+	 */
 
-	if (gen[0] > sb->gen && gen[1] > sb->gen) {
-		if (gen[0] == sb->gen + 1) {
+	/*
+	 * If both log gen numbers are bigger than sb mapping gen, it says patch has
+	 * not completed.
+	 */
+	if (gen[0] > sb->mapping_gen && gen[1] > sb->mapping_gen) {
+		/*
+		 * log 0 is the first to be used by default
+		 */
+		if (gen[0] == sb->mapping_gen + 1) {
 			patch = 0;
-			WARN_ON(gen[1] != sb->gen + 2);
+			WARN_ON(gen[1] != sb->mapping_gen + 2);
 			run = 1;
-		} else if (gen[1] == sb->gen + 1) {
+		} else if (gen[1] == sb->mapping_gen + 1) {
 			patch = 1;
-			WARN_ON(gen[0] != sb->gen + 2);
+			WARN_ON(gen[0] != sb->mapping_gen + 2);
 			run = 0;
 		} else {
 			WARN_ON(1);
 		}
 	}
 
-	if (gen[0] == sb->gen) {
-		WARN_ON((gen[1] != sb->gen + 1));
+	if (gen[0] == sb->mapping_gen) {
+		WARN_ON(gen[1] != sb->mapping_gen + 1);
 		run = 1;
 	}
 
-	if (gen[1] == sb->gen) {
-		WARN_ON((gen[0] != sb->gen + 1));
+	if (gen[1] == sb->mapping_gen) {
+		WARN_ON(gen[0] != sb->mapping_gen + 1);
 		run = 0;
 	}
 
@@ -1332,11 +1933,12 @@ static int sc_replay_log(struct sc_backing_dev *scbd)
 
 	/*
 	 * run means we need to patch the log entries that have bigger
-	 * gen than sb->gen and need to set the log_offset and log_page_offset.
+	 * gen than sb->mapping_gen and need to set the log_offset and log_page_offset.
 	 */
 	if (run >= 0)
-		sc_log_replay_run(sl, patch);
+		sc_log_replay_run(sl, run);
 
+	sb->run_gen = gen[run];
 	return 0;
 }
 
@@ -1366,7 +1968,6 @@ static int sc_setup_log(struct sc_backing_dev *scbd)
 		pr_err("Failed to get log page\n");
 		return -ENOMEM;
 	}
-	memset(page_address(sl->log_page), 0, PAGE_SIZE);
 	return 0;
 }
 
@@ -1398,9 +1999,13 @@ static int sc_setup_cache(struct sc_backing_dev *scbd)
 		goto fail_log;
 	ret = sc_replay_log(scbd);
 	ret = sc_handle_mapping_early(scbd);
+
 	/*
 	 * writeabck is ready
 	 */
+	blk_mq_freeze_queue(scbd->front_queue);
+	WRITE_ONCE(scbd->mode, SC_CACHE_WRITEBACK);
+	blk_mq_unfreeze_queue(scbd->front_queue);
 
 	return ret;
 
@@ -1499,7 +2104,7 @@ static ssize_t sc_bd_stop_store(struct sc_backing_dev *scbd,
 	 */
 
 	sc_turndown_cache(scbd);
-
+	sc_destroy_log(scbd);
 	sc_put_sb(scbd);
 
 	bd_unlink_disk_holder(scbd->caching_dev, scbd->front_disk);
@@ -1512,6 +2117,45 @@ static ssize_t sc_bd_stop_store(struct sc_backing_dev *scbd,
 	return len;
 }
 
+static ssize_t sc_bd_map_show(struct sc_backing_dev *scbd, char *buf)
+{
+	unsigned long i = scbd->cb_offset;
+	struct sc_cache_info *sci;
+
+	for (; i < scbd->scis_total; i++) {
+		sci = sc_get_cache_info(scbd, i);
+		if (SC_CACHE_INFO_STATE(sci->status))
+			printk("[%lx -> %llx]: avg %d la %d if %d s %s\n",
+				i, sci->bb,
+				(int)SC_CACHE_INFO_AVG(sci->status),
+				(int)SC_CACHE_INFO_LAST(sci->status),
+				(int)SC_CACHE_INFO_INFLIGHT(sci->status),
+				sci_state_strings[SC_CACHE_INFO_STATE(sci->status)]);
+	}
+	return 0;
+}
+
+
+static ssize_t sc_bd_blocks_show(struct sc_backing_dev *scbd, char *buf)
+{
+	int i;
+
+	for (i = 0; i < SC_MAX_BITMAP_SLOTS; i++) {
+		printk("slot %d available %d\n", i, atomic_read(&scbd->slots[i].available));
+	}
+	return 0;
+}
+
+static struct sc_sysfs_entry sc_bd_blocks = {
+	.attr = {.name = "blocks", .mode = S_IRUSR},
+	.show = sc_bd_blocks_show,
+};
+
+static struct sc_sysfs_entry sc_bd_map = {
+	.attr = {.name = "map", .mode = S_IRUSR},
+	.show = sc_bd_map_show,
+};
+
 static struct sc_sysfs_entry sc_bd_cache = {
 	.attr = {.name = "cache", .mode = S_IWUSR },
 	.store = sc_bd_cache_store,
@@ -1523,6 +2167,8 @@ static struct sc_sysfs_entry sc_bd_stop = {
 };
 
 static struct attribute *default_attrs[] = {
+	&sc_bd_blocks.attr,
+	&sc_bd_map.attr,
 	&sc_bd_cache.attr,
 	&sc_bd_stop.attr,
 	NULL
@@ -1626,10 +2272,9 @@ static int sc_backing_init(struct sc_backing_dev *scbd)
 	blk_set_stacking_limits(&q->limits);
 
 	queue_flag_set_unlocked(QUEUE_FLAG_NONROT,	q);
-	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD,	q);
+	//queue_flag_set_unlocked(QUEUE_FLAG_DISCARD,	q);
 	queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, q);
 	blk_queue_write_cache(q, true, true);
-
 	add_disk(front_disk);
 
 	kobject_init(&scbd->kobj, &sc_bd_ktype);
