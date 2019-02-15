@@ -74,6 +74,7 @@ struct sc_cache_info {
 	uint64_t bb; /* block of backing device */
 	uint32_t cb;
 	struct llist_head pending_list; /* readahead, dirty log */
+	rwlock_t rwlock;
 };
 enum sci_state {
 	SCI_READAHEAD = 0,
@@ -89,6 +90,22 @@ enum sci_state {
 #define SC_CACHE_INFO(l, a, f, s) \
 	(((uint64_t)l << 48) | (((uint64_t)a << 32) & 0xffff) | \
 	 ((f & 0xffffffff) << 2) | s)
+
+static inline void sci_read_lock(struct sc_cache_info *sci)
+{
+	read_lock(&sci->rwlock);
+}
+
+static inline void sci_read_unlock(struct sc_cache_info *sci)
+{
+	read_unlock(&sci->rwlock);
+}
+
+static inline void sci_sync(struct sc_cache_info *sci)
+{
+	write_lock(&sci->rwlock);
+	write_unlock(&sci->rwlock);
+}
 
 /*
  * Process of reclaim a cache block

@@ -512,7 +512,18 @@ static void sc_ra_complete(struct sc_ra_io *raio)
 	 */
 	data = 	SC_CACHE_INFO(0, 0, 0, SCI_CLEAN);
 	WRITE_ONCE(sci->status, data);
-	smp_mb__before_atomic();
+	/*
+	 * sci_read_lock
+	 * get SCI_READAHEAD
+	 * add to pending_list    set SCI_CLEAN
+	 * sci_read_unlock
+	 *                        sci_sync
+	 * Therefore,
+	 * sc_ra_complete could see all of the sci
+	 * added on pending_list if someone doesn't
+	 * see SCI_CLEAN.
+	 */
+	sci_sync(sci);
 	sc_handle_pending_list(sci);
 }
 
@@ -557,15 +568,6 @@ static void sc_cache_readahead(struct sc_backing_dev *scbd,
 	struct sc_ra_io *raio;
 	int i;
 
-	if (SC_CACHE_INFO_STATE(READ_ONCE(sci->status)) != SCI_READAHEAD) {
-		/*
-		 * FIXME
-		 *   we should avoid invoke sc_writeback in itself.
-		 */
-		sc_handle_pending_list(sci);
-		return;
-	}
-
 	raio = sc_alloc_raio(sb->block_size / PAGE_SIZE);
 	raio->scbd = scbd;
 	raio->sci = sci;
@@ -599,6 +601,7 @@ static void sc_dirty_log_done(void *data)
 	struct sc_cache_info *sci = data;
 
 	sc_cache_dirty(sci);
+	sci_sync(sci);
 	sc_handle_pending_list(sci);
 }
 
@@ -637,6 +640,8 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 	struct bio *bio = sio->front_bio;
 	struct bio *clone = &sio->clone;
 	sector_t offset = bio->bi_iter.bi_sector;
+	bool first;
+
 	/*
 	 * FIXME:
 	 *   the cblock unit is not consistent across the code,
@@ -672,9 +677,10 @@ retry:
 		bio_endio(bio);
 		return BLK_QC_T_NONE;
 	}
-
+	sci_read_lock(sci);
 	switch (sc_cache_start(sci, sio->started)) {
 	case SCI_INVALID:
+		sci_read_unlock(sci);
 		goto retry;
 	case SCI_READAHEAD:
 		/*
@@ -683,10 +689,13 @@ retry:
 		 * otherwise, the readahead block maybe different from the one on
 		 * backing device.
 		 */
-		if (llist_add(&sio->node, &sci->pending_list)) {
-			smp_mb__after_atomic();
+		first = llist_add(&sio->node, &sci->pending_list);
+		/*
+		 * See comments in sc_ra_complete
+		 */
+		sci_read_unlock(sci);
+		if (first)
 			sc_cache_readahead(scbd, sci, cblock, offset >> sb->bitsbsz2sc);
-		}
 		break;
 	case SCI_CLEAN:
 		/*
@@ -694,7 +703,12 @@ retry:
 		 */
 		if (op_is_write(bio_op(bio))) {
 			sio->started = true;
-			if (llist_add(&sio->node, &sci->pending_list))
+			first = llist_add(&sio->node, &sci->pending_list);
+			/*
+			 * Same with readahead path
+			 */
+			sci_read_unlock(sci);
+			if (first)
 				sc_dirty_log(sci, scbd);
 			break;
 		}
@@ -705,6 +719,7 @@ retry:
 		/*
 		 * cache hit
 		 */
+		sci_read_unlock(sci);
 		sio->started = true;
 		sio->sci = sci;
 		__bio_clone_fast(clone, bio);
@@ -1336,6 +1351,7 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 	uint64_t depth, slot, len, mt_to;
 	int sci_per_page;
 	sector_t caching_size = part_nr_sects_read(scbd->caching_dev->bd_part);
+	struct sc_cache_info *sci;
 
 	mt_to = (3 * sb->maplen) + PAGE_SIZE;
 	mt_to = round_up(mt_to, sb->block_size);
@@ -1350,6 +1366,10 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 	sci_per_page = PAGE_SIZE / sizeof(struct sc_cache_info);
 	len = (depth / sci_per_page) + 1;
 
+	/*
+	 * TODO
+	 *   initialization of scis array should be moved out
+	 */
 	scbd->scis = kzalloc(sizeof(void *) * len, GFP_KERNEL);
 	if (!scbd->scis) {
 		pr_err("Failed to allocate sc_cache_info array\n");
@@ -1357,7 +1377,7 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 	}
 	scbd->scis_arrary_len = len;
 	for (i = 0; i < len; i++) {
-		scbd->scis[i] = kzalloc(PAGE_SIZE, GFP_KERNEL);
+		scbd->scis[i] = kmalloc(PAGE_SIZE, GFP_KERNEL);
 		if (!scbd->scis[i]) {
 			pr_err("Failed to allocate sc_cache_info entry\n");
 			for (; i >=0; i--)
@@ -1366,6 +1386,15 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 			return -ENOMEM;
 		}
 	}
+
+	for (i = 0; i < scbd->scis_total; i++) {
+		i += scbd->cb_offset;
+		sci = sc_get_cache_info(scbd, i);
+		sci->status = SC_CACHE_INFO(0, 0, 0, SCI_READAHEAD);
+		rwlock_init(&sci->rwlock);
+		init_llist_head(&sci->pending_list);
+	}
+
 	pr_info("available blocks in caching device %llu\n", depth);
 
 	slot = depth / SC_MAX_BITMAP_SLOTS;
