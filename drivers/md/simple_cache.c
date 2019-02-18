@@ -930,6 +930,7 @@ static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, i
 		end = start + SC_LOG_ENTRIES_PER_PAGE;
 		for (; start < end; start++) {
 			data = READ_ONCE(start->data);
+
 			if (!SC_LOG_VALID(data)) {
 				/*
 				 * run   patch
@@ -979,6 +980,8 @@ static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, i
 				break;
 			case SC_LOG_OP_DIRTY_CLEAN:
 				e->data &= ~(1 << SC_ENTRY_FLAGS_DIRTY_SHIFT);
+				break;
+			case SC_LOG_OP_NOP:
 				break;
 			default:
 				WARN_ON(1);
@@ -1135,21 +1138,21 @@ static void sc_log_insert_work(struct work_struct *work)
 	struct sc_sb *sb = sl->sb;
 	uint32_t *addr = page_address(sl->log_page);
 	int offset = sl->log_page_offset;
-	struct llist_node *first, *node, *stop, *next;
+	struct llist_node *node, *stop, *next, *start;
 	struct sc_log_item *sli;
 	struct bio *bio;
 
-	BUG_ON(offset >= (PAGE_SIZE/SC_CACHE_MAPPING_ENTRY_SIZE));
-	first = llist_del_all(&sl->list);
+	BUG_ON(offset > (PAGE_SIZE/SC_CACHE_MAPPING_ENTRY_SIZE));
+	start = llist_del_all(&sl->list);
 repeat:
-	if (!first)
+	if (!start)
 		return;
 	stop = NULL;
 	/*
 	 * FIXME:
 	 *   the list is newest to oldest, we should traverse it in reverse odler
 	 */
-	llist_for_each_safe(node, next, first){
+	llist_for_each_safe(node, next, start){
 
 		sli = container_of(node, struct sc_log_item, node);
 		trace_printk("bb %x cb %x op %s offset %x run gen %d\n",
@@ -1157,6 +1160,21 @@ repeat:
 			sc_log_op_strings[sli->op],
 			offset,
 			sb->run_gen);
+
+		/*
+		 * MAP_SET need two entries.
+		 */
+		if (sli->op == SC_LOG_OP_MAP_SET &&
+			offset == (SC_LOG_ENTRIES_PER_PAGE - 1)) {
+			addr[offset] = SC_LOG_CONSTRUCT(sli->cb, sb->run_gen, SC_LOG_OP_NOP);
+			offset++;
+		}
+
+		if (offset >= SC_LOG_ENTRIES_PER_PAGE) {
+			stop = node;
+			offset = 0;
+			break;
+		}
 		/*
 		 * The previous log entries will be overwritten.
 		 */
@@ -1165,11 +1183,6 @@ repeat:
 		if (sli->op == SC_LOG_OP_MAP_SET) {
 			addr[offset] = sli->bb;
 			offset++;
-		}
-		if (offset >= SC_LOG_ENTRIES_PER_PAGE) {
-			stop = node;
-			offset = 0;
-			break;
 		}
 	}
 	sl->log_page_offset = offset;
@@ -1181,14 +1194,13 @@ repeat:
 	WARN_ON(submit_bio_wait(bio));
 	bio_put(bio);
 
-	llist_for_each_safe(node, next, first){
+	llist_for_each_safe(node, next, start){
+		if (node == stop)
+			break;
 		sli = container_of(node, struct sc_log_item, node);
 		sli->log_done(sli->private);
 		kfree(sli);
-		if (node == stop)
-			break;
 	}
-
 	/*
 	 * Turn page
 	 */
@@ -1209,7 +1221,7 @@ repeat:
 			pr_info("run log gen update to %d\n", sb->run_gen);
 			queue_work(sc_workqueue, &sl->patch_work);
 		}
-		first = next;
+		start = stop;
 		goto repeat;
 	}
 }
@@ -1388,8 +1400,7 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 	}
 
 	for (i = 0; i < scbd->scis_total; i++) {
-		i += scbd->cb_offset;
-		sci = sc_get_cache_info(scbd, i);
+		sci = sc_get_cache_info(scbd, i + scbd->cb_offset);
 		sci->status = SC_CACHE_INFO(0, 0, 0, SCI_READAHEAD);
 		rwlock_init(&sci->rwlock);
 		init_llist_head(&sci->pending_list);
@@ -1699,7 +1710,7 @@ static int sc_handle_mapping_early(struct sc_backing_dev *scbd)
 			if (SC_ENTRY_VALID(data)) {
 				bblock = SC_ENTRY_BLOCK(data);
 				if (bblock > sb->bmaplen/SC_CACHE_MAPPING_ENTRY_SIZE) {
-					pr_err("mapping entry is corrupted, bb %lx\n", bblock);
+					pr_err("mapping entry is corrupted %x\n", start->data);
 					continue;
 				}
 				sc_block_set(scbd, cblock);
@@ -2101,9 +2112,6 @@ fail:
 static void sc_turndown_cache(struct sc_backing_dev *scbd)
 {
 	/*
-	 * Flush dirty metadata into disk
-	 */
-	/*
 	 * Free mapping data
 	 */
 	sc_destroy_mapping(scbd);
@@ -2123,6 +2131,10 @@ static ssize_t sc_bd_stop_store(struct sc_backing_dev *scbd,
 		pr_warn("Caching device has been detached\n");
 		return -EINVAL;
 	}
+
+	blk_mq_freeze_queue(scbd->front_queue);
+	WRITE_ONCE(scbd->mode, SC_CACHE_PASSTHROUGH);
+	blk_mq_unfreeze_queue(scbd->front_queue);
 	/*
 	 * Start write through mod
 	 * then we could delete the caching device transparently

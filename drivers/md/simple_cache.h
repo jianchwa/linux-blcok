@@ -239,7 +239,8 @@ struct sc_sysfs_entry {
  * 1 		mapping clear
  * 2 		dirty set
  * 3 		drity clear
- * 4 ~ 7 	reserved
+ * 4        nop
+ * 5 ~ 7 	reserved
  *
  * The mapping log area is 2 times of mapping entry array.
  * So we have 2 log rings. When one is full, we switch to another one
@@ -305,6 +306,7 @@ typedef struct sc_log sc_log_t;
 #define SC_LOG_OP_MAP_CLEAN 1
 #define SC_LOG_OP_DIRTY_SET 2
 #define SC_LOG_OP_DIRTY_CLEAN 3
+#define SC_LOG_OP_NOP 4
 
 #define SC_LOG_BLOCK_SHIFT 8
 #define SC_LOG_GEN_SHIFT 3
