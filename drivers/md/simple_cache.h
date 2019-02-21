@@ -32,6 +32,29 @@ enum sc_cache_mode {
 	SC_CACHE_WRITEBACK,
 };
 
+#define SC_CACHE_TIMEOUT (25 * HZ)
+#define SC_CACHE_RECLAIM_INTERVAL (10 * HZ)
+
+enum sc_rc_state {
+	SC_RC_RD = 0,
+	SC_RC_WB,
+	SC_RC_LOG,
+	SC_RC_CLEAN_MAPPING,
+	SC_RC_COMPLETE,
+};
+
+struct sc_rc_io {
+	struct sc_cache_info *sci;
+	struct sc_backing_dev *scbd;
+	unsigned long bb, cb;
+	struct page **pages;
+	struct bio *bio;
+	int nr;
+	enum sc_rc_state state;
+	struct work_struct async_work;
+	struct rcu_head rcu;
+};
+
 enum sc_ra_state {
 	SC_RA_READ_BACKING,
 	SC_RA_WRITE_CACHING,
@@ -80,7 +103,7 @@ enum sci_state {
 	SCI_READAHEAD = 0,
 	SCI_CLEAN,
 	SCI_DIRTY,
-	SCI_INVALID,
+	SCI_RECLAIMING,
 };
 
 #define SC_CACHE_INFO_STATE(i) (i & 0x3)
@@ -101,6 +124,10 @@ static inline void sci_read_unlock(struct sc_cache_info *sci)
 	read_unlock(&sci->rwlock);
 }
 
+/*
+ * We use rwlock instead of rcu because both sides are in
+ * hot path. synchronize_rcu is very expensive.
+ */
 static inline void sci_sync(struct sc_cache_info *sci)
 {
 	write_lock(&sci->rwlock);
@@ -163,6 +190,8 @@ struct sc_backing_dev {
 	unsigned long scis_total;
 	unsigned long cb_offset;
 	wait_queue_head_t wait_invalidate;
+
+	struct delayed_work	reclaim_work;
 
 	struct gendisk *front_disk;
 	struct request_queue *front_queue;
@@ -408,6 +437,7 @@ struct sc_log_sb {
  * In-core scache super block
  */
 struct sc_sb {
+	struct sc_backing_dev *scbd;
 	uint32_t 	block_size;
 	uint8_t 	bitsbsz2sc; /* bits need to shift to convert
 				       from block_size to sector or reverse */

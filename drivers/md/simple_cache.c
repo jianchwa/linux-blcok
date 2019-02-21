@@ -37,9 +37,9 @@ static char *sc_log_op_strings[] = {
 
 static char *sci_state_strings[] = {
 	"READAHEAD",
-	"CLEAR",
+	"CLEAN",
 	"DIRTY",
-	"INVALID"
+	"RECLAIMING"
 };
 
 static char *sc_ra_state_strings[] = {
@@ -49,12 +49,24 @@ static char *sc_ra_state_strings[] = {
 	"COMPLETE"
 };
 
+static char *sc_rc_state_strings[] = {
+	"READ_DIRTY",
+	"WRITE_CACHE",
+	"LOG",
+	"CLEAN_MAPPING",
+	"COMPLETE"
+};
+
 static int sc_get_mapping_entry(struct sc_backing_dev *scbd, sector_t sec);
 static int sc_block_alloc(struct sc_backing_dev *scbd);
 static blk_qc_t sc_writeback(struct sc_io *sio);
 static void sc_ra_sm(struct sc_ra_io *raio);
 static void sc_log_insert(struct sc_log_item *sli);
 static void sc_cache_complete(struct sc_cache_info *sci);
+static void sc_handle_pending_list(struct sc_cache_info *sci);
+static void sc_rc_sm(struct sc_rc_io *rcio);
+static void sc_block_free(struct sc_backing_dev *scbd, int block);
+static bool sc_cache_reclaim(struct sc_cache_info *sci, bool *dirty);
 
 struct sc_multi_io {
 	atomic_t bios;
@@ -197,7 +209,266 @@ static blk_qc_t sc_passthrough(struct sc_io *sio)
 	return submit_bio(clone);
 }
 
-void sc_writeback_endio(struct bio *clone)
+static void sc_rc_endio(struct bio *bio)
+{
+	struct sc_rc_io *rcio = bio->bi_private;
+
+	queue_work(sc_workqueue, &rcio->async_work);
+}
+
+static void sc_rc_read_cache(struct sc_rc_io *rcio)
+{
+	struct sc_backing_dev *scbd = rcio->scbd;
+	struct bio *bio;
+	int i;
+
+	bio = bio_alloc(GFP_NOIO, rcio->nr);
+	bio->bi_iter.bi_sector = rcio->cb << scbd->sb->bitsbsz2sc;
+	bio_set_dev(bio, scbd->caching_dev);
+	bio_set_op_attrs(bio, REQ_OP_READ, 0);
+	for (i = 0; i < rcio->nr; i++)
+		bio_add_page(bio, rcio->pages[i], PAGE_SIZE, 0);
+	bio->bi_private = rcio;
+	bio->bi_end_io = sc_rc_endio;
+
+	rcio->state = SC_RC_WB; /* next step */
+	rcio->bio = bio;
+
+	submit_bio(bio);
+}
+
+static void sc_rc_write_back(struct sc_rc_io *rcio)
+{
+	struct sc_backing_dev *scbd = rcio->scbd;
+	struct sc_sb *sb = scbd->sb;
+	struct bio *bio = rcio->bio;
+	int i;
+
+	bio_init(bio, bio->bi_io_vec, rcio->nr);
+	bio->bi_iter.bi_sector = rcio->bb << sb->bitsbsz2sc;
+	bio_set_dev(bio, scbd->backing_dev);
+	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_FUA);
+	for (i = 0; i < rcio->nr; i++)
+		bio_add_page(bio, rcio->pages[i], PAGE_SIZE, 0);
+	bio->bi_private = rcio;
+	bio->bi_end_io = sc_rc_endio;
+
+	rcio->state = SC_RC_LOG; /* next step */
+
+	submit_bio(bio);
+}
+
+/*
+ * kworker task context
+ */
+static void sc_rc_log_done(void *data)
+{
+	sc_rc_sm(data);
+}
+
+static void sc_rc_log(struct sc_rc_io *rcio)
+{
+	struct sc_log_item *sli;
+
+	/*
+	 * TODO
+	 *  - mempool or kmem cache
+	 */
+	sli = kmalloc(sizeof(*sli), GFP_NOIO);
+	sli->sl = &rcio->scbd->sb->log;
+	sli->op = SC_LOG_OP_MAP_CLEAN;
+	sli->cb = rcio->cb;
+	sli->bb = ~0;
+	sli->log_done = sc_rc_log_done;
+	sli->private = rcio;
+
+	rcio->state = SC_RC_CLEAN_MAPPING; /* next step */
+
+	sc_log_insert(sli);
+}
+
+static void sc_rc_rcu_clean_mapping(struct rcu_head *rcu)
+{
+	struct sc_rc_io *rcio = container_of(rcu, struct sc_rc_io, rcu);
+
+	rcio->state = SC_RC_COMPLETE;
+	queue_work(sc_workqueue, &rcio->async_work);
+}
+
+static void sc_rc_clean_mapping(struct sc_rc_io *rcio)
+{
+	struct sc_backing_dev *scbd = rcio->scbd;
+	struct sc_sb *sb = scbd->sb;
+	struct sc_cache_info *sci = rcio->sci;
+	struct sc_cache_entry *entry;
+
+	entry = sb->mappings[sci->bb / SC_CACHE_ENTRIES_PER_PAGE];
+	entry += (sci->bb % SC_CACHE_ENTRIES_PER_PAGE);
+
+	WRITE_ONCE(entry->cb, 0);
+	/*
+	 * Ensure the write above is visible
+	 */
+	call_rcu(&rcio->rcu, sc_rc_rcu_clean_mapping);
+}
+
+static void sc_free_rcio(struct sc_rc_io *rcio)
+{
+	int i;
+
+	for (i = 0; i < rcio->nr; i++)
+		put_page(rcio->pages[i]);
+	if (rcio->bio)
+		bio_put(rcio->bio);
+	if (rcio->pages)
+		kfree(rcio->pages);
+	kfree(rcio);
+}
+/*
+ * TODO
+ *   reclaim process could be interrupted
+ */
+static void sc_rc_sm(struct sc_rc_io *rcio)
+{
+	trace_printk("rc bb %lx cb %lx %s\n",
+			rcio->bb, rcio->cb, sc_rc_state_strings[rcio->state]);
+	switch(rcio->state) {
+	case SC_RC_RD:
+		/*
+		 * Read in the dirty cache
+		 * Interruptible
+		 */
+		sc_rc_read_cache(rcio);
+		break;
+	case SC_RC_WB:
+		/*
+		 * Writeback the dirty cache
+		 * Interruptible
+		 */
+		sc_rc_write_back(rcio);
+		break;
+	case SC_RC_LOG:
+		/*
+		 * mapping clean log
+		 * Interruptible
+		 */
+		sc_rc_log(rcio);
+		break;
+	case SC_RC_CLEAN_MAPPING:
+		/*
+		 * Free the cb
+		 * Interruptible
+		 */
+		sc_rc_clean_mapping(rcio);
+		break;
+	case SC_RC_COMPLETE:
+		/*
+		 * Handle pending list
+		 */
+		sc_handle_pending_list(rcio->sci);
+		WRITE_ONCE(rcio->sci->status, SC_CACHE_INFO(0, 0, 0, SCI_READAHEAD));
+		sc_block_free(rcio->scbd, rcio->cb);
+		sc_free_rcio(rcio);
+		break;
+	default:
+		WARN_ON(1);
+		break;
+	}
+}
+
+static void sc_rc_async_work(struct work_struct *work)
+{
+	struct sc_rc_io *rcio = container_of(work, struct sc_rc_io, async_work);
+
+	sc_rc_sm(rcio);
+}
+
+static void sc_reclaim_one(struct sc_backing_dev *scbd,
+		struct sc_cache_info *sci, bool dirty)
+{
+	struct sc_rc_io *rcio;
+	int nr, i;
+
+	rcio = kmalloc(sizeof(*rcio), GFP_NOIO);
+	rcio->scbd = scbd;
+	rcio->sci = sci;
+	rcio->bb = sci->bb;
+	rcio->cb = sci->cb;
+	rcio->bio = NULL;
+	INIT_WORK(&rcio->async_work, sc_rc_async_work);
+
+	if (dirty) {
+		nr = scbd->sb->block_size / PAGE_SIZE;
+		rcio->pages = kmalloc(sizeof(void *) * nr, GFP_NOIO);
+		for (i = 0; i < nr; i++) {
+			rcio->pages[i] = alloc_page(GFP_NOIO);
+			BUG_ON(!rcio->pages[i]);
+		}
+		rcio->nr = nr;
+		rcio->state = SC_RC_RD;
+	} else {
+		rcio->pages = NULL;
+		rcio->nr = 0;
+		rcio->state = SC_RC_LOG;
+	}
+
+	queue_work(sc_workqueue, &rcio->async_work);
+}
+
+/*
+ * This is the very core algorithm
+ */
+static bool sc_should_reclaim(struct sc_cache_info *sci)
+{
+	uint16_t last, now;
+	uint64_t data = READ_ONCE(sci->status);
+	enum sci_state state = SC_CACHE_INFO_STATE(data);
+
+	/*
+	 * We can only reclaim CLEAN and DIRTY entries
+	 */
+	if (state != SCI_CLEAN && state != SCI_DIRTY)
+		return false;
+#if 0
+	now = (uint16_t)jiffies;
+	last = SC_CACHE_INFO_LAST(READ_ONCE(sci->status));
+
+	if (now > last + SC_CACHE_TIMEOUT)
+		return true;
+#endif
+	return true;
+}
+
+static void sc_reclaim(struct sc_backing_dev *scbd)
+{
+	int i;
+	struct sc_cache_info *sci;
+	bool dirty;
+
+	for (i = 0; i < scbd->scis_total; i ++) {
+		sci = sc_get_cache_info(scbd, i + scbd->cb_offset);
+		if (!sc_should_reclaim(sci))
+			continue;
+
+		if (!sc_cache_reclaim(sci, &dirty))
+			continue;
+
+		sc_reclaim_one(scbd, sci, dirty);
+	}
+}
+
+static void sc_reclaim_work(struct work_struct *work)
+{
+	struct sc_backing_dev *scbd = container_of(work, struct sc_backing_dev, reclaim_work.work);
+
+	pr_info("%s run...\n", __func__);
+	sc_reclaim(scbd);
+
+	queue_delayed_work(sc_workqueue, &scbd->reclaim_work,
+			SC_CACHE_RECLAIM_INTERVAL);
+}
+
+static void sc_writeback_endio(struct bio *clone)
 {
 	struct sc_io *sio = clone->bi_private;
 	struct bio *bio = sio->front_bio;
@@ -215,7 +486,7 @@ void sc_writeback_endio(struct bio *clone)
 
 static bool sc_cache_clean(struct sc_cache_info *sci)
 {
-	uint64_t new, old;
+	uint64_t new, old, res;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
@@ -226,35 +497,34 @@ static bool sc_cache_clean(struct sc_cache_info *sci)
 							SC_CACHE_INFO_AVG(old),
 							SC_CACHE_INFO_INFLIGHT(old),
 							SCI_CLEAN);
-		old = cmpxchg(&sci->status, old, new);
-		if (old == new)
+		res = cmpxchg(&sci->status, old, new);
+		if (old == res)
 			return true;
+		old = res;
 	}
 }
 
-static bool sc_cache_invalidate(struct sc_sb *sb, struct sc_cache_info *sci)
+static bool sc_cache_reclaim(struct sc_cache_info *sci, bool *dirty)
 {
-	uint64_t new, old;
-	struct sc_cache_entry *entry;
+	uint64_t new, old, res;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
-		/*
-		 * We can only invalidate clean cache block
-		 */
-		if (SC_CACHE_INFO_INFLIGHT(old) ||
-			(SC_CACHE_INFO_STATE(old) == SCI_CLEAN))
+		if (SC_CACHE_INFO_INFLIGHT(old)) {
+			trace_printk("cb %x if %x\n",
+					sci->cb,
+					(int)SC_CACHE_INFO_INFLIGHT(old));
 			return false;
+		}
 
-		new = SC_CACHE_INFO(0, 0, 0, SCI_INVALID);
-		old = cmpxchg(&sci->status, old, new);
-		if (old == new)
+		new = SC_CACHE_INFO(0, 0, 0, SCI_RECLAIMING);
+		*dirty = SC_CACHE_INFO_STATE(old) == SCI_DIRTY;
+		res = cmpxchg(&sci->status, old, new);
+		if (old == res)
 			break;
+		old = res;
 	}
-	entry = sb->mappings[sci->bb / SC_CACHE_ENTRIES_PER_PAGE];
-	entry += (sci->bb % SC_CACHE_ENTRIES_PER_PAGE);
 
-	WRITE_ONCE(entry->cb, 0);
 	return true;
 }
 
@@ -277,11 +547,11 @@ static unsigned long sc_calc_complete(uint64_t old)
 
 static void sc_cache_complete(struct sc_cache_info *sci)
 {
-	uint64_t old, new;
+	uint64_t old, new, res;
 
 	old = READ_ONCE(sci->status);
 
-	if (SC_CACHE_INFO_STATE(old) == SCI_INVALID ||
+	if (SC_CACHE_INFO_STATE(old) == SCI_RECLAIMING ||
 		SC_CACHE_INFO_STATE(old) == SCI_READAHEAD) {
 		WARN(1, "Wrong sci state %d\n", (int)SC_CACHE_INFO_STATE(old));
 		return;
@@ -289,9 +559,14 @@ static void sc_cache_complete(struct sc_cache_info *sci)
 
 	while (1) {
 		new = sc_calc_complete(old);
-		old = cmpxchg(&sci->status, old, new);
-		if (old == new)
-			break;;
+		res = cmpxchg(&sci->status, old, new);
+		if (old == res) {
+			trace_printk("ended cb %x if %x\n",
+					sci->cb,
+					(int)SC_CACHE_INFO_INFLIGHT(old));
+			break;
+		}
+		old = res;
 	}
 }
 
@@ -311,7 +586,7 @@ static unsigned long sc_calc_dirty(uint64_t old)
  */
 static void sc_cache_dirty(struct sc_cache_info *sci)
 {
-	uint64_t old, new;
+	uint64_t old, new, res;
 
 	old = READ_ONCE(sci->status);
 
@@ -319,26 +594,33 @@ static void sc_cache_dirty(struct sc_cache_info *sci)
 
 	while (1) {
 		new = sc_calc_dirty(old);
-		old = cmpxchg(&sci->status, old, new);
-		if (old == new)
-			break;;
+		res = cmpxchg(&sci->status, old, new);
+		if (old == res)
+			break;
+		old = res;
 	}
 }
 
 static unsigned long sc_calc_start(uint64_t old)
 {
-	uint64_t now, last, avg, inv, inflight;
+	uint32_t now, last, avg, inv, inflight;
 	enum sci_state state;
 
 	now = jiffies;
 	last = SC_CACHE_INFO_LAST(old);
-	inv = now - last;
 	inflight = SC_CACHE_INFO_INFLIGHT(old);
 	avg = SC_CACHE_INFO_AVG(old);
 	state = SC_CACHE_INFO_STATE(old);
-	avg *= 8;
-	avg += inv;
-	avg /= 8;
+	if (last) {
+		inv = now - last;
+		if (avg) {
+			avg *= 8;
+			avg += inv;
+			avg /= 8;
+		} else {
+			avg = inv;
+		}
+	}
 	last = now;
 	inflight++;
 
@@ -347,18 +629,18 @@ static unsigned long sc_calc_start(uint64_t old)
 
 static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started)
 {
-	uint64_t old, new;
+	uint64_t old, new, res;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
-		trace_printk("cache start bb %llx %s\n",
-				sci->bb, sci_state_strings[SC_CACHE_INFO_STATE(old)]);
+		trace_printk("try start cb %x if %x s %s %d\n",
+				sci->cb,
+				(int)SC_CACHE_INFO_INFLIGHT(old),
+				sci_state_strings[SC_CACHE_INFO_STATE(old)],
+				started);
 
-		if (SC_CACHE_INFO_STATE(old) == SCI_INVALID) {
-			pr_info("Accessing a cache block with being invalidated %llx\n",
-					sci->bb);
-			return SCI_INVALID;
-		}
+		if (unlikely(SC_CACHE_INFO_STATE(old) == SCI_RECLAIMING))
+			return SCI_RECLAIMING;
 
 		/*
 		 * cblock under SCI_READAHEAD will not be reclaimed.
@@ -381,12 +663,17 @@ static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started)
 		 *   Why does cmpxchg always tries two times even if no one races with
 		 *   it ?
 		 */
-		old = cmpxchg(&sci->status, old, new);
+		res = cmpxchg(&sci->status, old, new);
 		/*
 		 * We wins.
 		 */
-		if (old == new)
+		if (old == res) {
+			trace_printk("started cb %x if %x\n",
+					sci->cb,
+					(int)SC_CACHE_INFO_INFLIGHT(old));
 			return SC_CACHE_INFO_STATE(old);
+		}
+		old = res;
 	}
 }
 
@@ -451,7 +738,7 @@ static void sc_ra_endio(struct bio *bio)
 static void sc_ra_write_cache(struct sc_ra_io *raio)
 {
 	struct sc_backing_dev *scbd = raio->scbd;
-	struct bio *bio = raio->bio;
+	struct bio *bio;
 	int i;
 
 	/*
@@ -657,7 +944,7 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 				bio->bi_iter.bi_sector, bio_end_sector(bio));
 	}
 
-retry:
+	rcu_read_lock();
 	cblock = sc_get_mapping_entry(scbd, offset);
 	if (cblock <= 0) {
 		/* 1. last part which is smaller than block size
@@ -666,22 +953,27 @@ retry:
 		 *      This is not a good way.
 		 *      Please refer to comments in SCI_READAHEAD case
 		 */
+		rcu_read_unlock();
 		pr_warn("passthrough\n");
 		goto passthrough;
 	}
 
 	sci = sc_get_cache_info(scbd, cblock);
 	if (!sci) {
+		rcu_read_unlock();
 		pr_err("NULL sci for cb %x off%lx\n", cblock, offset);
 		bio->bi_status = BLK_STS_IOERR;
 		bio_endio(bio);
 		return BLK_QC_T_NONE;
 	}
+
 	sci_read_lock(sci);
 	switch (sc_cache_start(sci, sio->started)) {
-	case SCI_INVALID:
+	case SCI_RECLAIMING:
+		llist_add(&sio->node, &sci->pending_list);
 		sci_read_unlock(sci);
-		goto retry;
+		rcu_read_unlock();
+		break;
 	case SCI_READAHEAD:
 		/*
 		 * trigger readahead
@@ -694,6 +986,7 @@ retry:
 		 * See comments in sc_ra_complete
 		 */
 		sci_read_unlock(sci);
+		rcu_read_unlock();
 		if (first)
 			sc_cache_readahead(scbd, sci, cblock, offset >> sb->bitsbsz2sc);
 		break;
@@ -708,6 +1001,7 @@ retry:
 			 * Same with readahead path
 			 */
 			sci_read_unlock(sci);
+			rcu_read_unlock();
 			if (first)
 				sc_dirty_log(sci, scbd);
 			break;
@@ -720,6 +1014,7 @@ retry:
 		 * cache hit
 		 */
 		sci_read_unlock(sci);
+		rcu_read_unlock();
 		sio->started = true;
 		sio->sci = sci;
 		__bio_clone_fast(clone, bio);
@@ -919,6 +1214,7 @@ static const struct sysfs_ops sc_bd_sysfs_ops = {
  */
 static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, int nr)
 {
+	struct sc_backing_dev *scbd = sb->scbd;
 	sc_log_t *start, *end;
 	uint32_t data;
 	int i;
@@ -962,6 +1258,11 @@ static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, i
 				goto out;
 			}
 			cblock = SC_LOG_BLOCK(data);
+			if (cblock - scbd->cb_offset >= scbd->scis_total) {
+				pr_err("Corrupted log entry %x\n", data);
+				continue;
+			}
+
 			e = (sc_entry_t *)page_address(sb->map_pages[cblock/SC_MAPPING_ENTRIES_PER_PAGE]);
 			e += cblock % SC_MAPPING_ENTRIES_PER_PAGE;
 			switch(SC_LOG_OPCODE(data)) {
@@ -1401,6 +1702,8 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 
 	for (i = 0; i < scbd->scis_total; i++) {
 		sci = sc_get_cache_info(scbd, i + scbd->cb_offset);
+		sci->cb = i + scbd->cb_offset;
+		sci->bb = ~0;
 		sci->status = SC_CACHE_INFO(0, 0, 0, SCI_READAHEAD);
 		rwlock_init(&sci->rwlock);
 		init_llist_head(&sci->pending_list);
@@ -1560,6 +1863,7 @@ static int sc_get_sb(struct sc_backing_dev *scbd)
 	sb->scblkmask = (1 << sb->bitsbsz2sc) - 1;
 	sb->sb_page = page;
 	scbd->sb = sb;
+	sb->scbd = scbd;
 
 	bio_put(bio);
 	return 0;
@@ -2040,6 +2344,8 @@ static int sc_setup_cache(struct sc_backing_dev *scbd)
 	ret = sc_replay_log(scbd);
 	ret = sc_handle_mapping_early(scbd);
 
+	queue_delayed_work(sc_workqueue, &scbd->reclaim_work,
+			SC_CACHE_RECLAIM_INTERVAL);
 	/*
 	 * writeabck is ready
 	 */
@@ -2111,6 +2417,17 @@ fail:
 
 static void sc_turndown_cache(struct sc_backing_dev *scbd)
 {
+	/* FIXME:
+	 * We must drain all of the work on reclaim work.
+	 */
+	cancel_delayed_work_sync(&scbd->reclaim_work);
+
+	/*
+	 * Drain all of the work in writeback and reclaim path,
+	 * could ensure insert_work to be able to stopped.
+	 * But we also need to sync (cancel should also be OK)
+	 * the patch work.
+	 */
 	/*
 	 * Free mapping data
 	 */
@@ -2132,6 +2449,17 @@ static ssize_t sc_bd_stop_store(struct sc_backing_dev *scbd,
 		return -EINVAL;
 	}
 
+	/*
+	 * FIXME
+	 *   When stop the cache, what should we do ?
+	 *   Flush all of the cache out and set paththrough ?
+	 *
+	 *   Anyway, it is not safe to set to passthrough directly.
+	 *   We set passthrough here just to avoid new work into sc_writeback.
+	 *
+	 *   drain all of the IO could ensure there is no pending work
+	 *   in sc_writeback path.
+	 */
 	blk_mq_freeze_queue(scbd->front_queue);
 	WRITE_ONCE(scbd->mode, SC_CACHE_PASSTHROUGH);
 	blk_mq_unfreeze_queue(scbd->front_queue);
@@ -2331,6 +2659,8 @@ static int sc_backing_init(struct sc_backing_dev *scbd)
 		goto fail_link_holder;
 	}
 	sc_backing_dev_add(scbd);
+
+	INIT_DELAYED_WORK(&scbd->reclaim_work, sc_reclaim_work);
 
 	return 0;
 fail_link_holder:
