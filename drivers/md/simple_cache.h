@@ -32,7 +32,6 @@ enum sc_cache_mode {
 	SC_CACHE_WRITEBACK,
 };
 
-#define SC_CACHE_TIMEOUT (25 * HZ)
 #define SC_CACHE_RECLAIM_INTERVAL (10 * HZ)
 
 enum sc_rc_state {
@@ -75,30 +74,35 @@ struct sc_ra_io {
 
 /*
  *
- * 63    48 47   32 31           2 1 0
- * |-------|-------|-------------|-|-|
+ *31  22 21       2 1 0
+ * |----|-------- -|-|
  *
- * 63:48    last access jiffies
- * 47:32    average access interval
- * 31:2     in-flight IO
+ * 31:22    access count
+ * 21:2     in-flight IO (1 million IO at the same time is enougth )
  * 1:0 		state
  *
- * 0 		invalid
- * 1 		readahead
- * 2 		clean
- * 4 		dirty
+ * 0 		readahead
+ * 1 		clean
+ * 2 		dirty
+ * 3 		reclaiming
  *
- * The max last access jiffies is 2^16 (32K), for a machine with HZ=1000,
- * it is about 32s. This is enougth, because a cache block must have been
- * invalidated before this. (Our GC period is less than 30s)
  */
+
+#define SCI_FLAG_HC_UPPER(f) (f & 0xffff)
+
 struct sc_cache_info {
-	uint64_t status;
-	uint64_t bb; /* block of backing device */
-	uint32_t cb;
+	struct {
+		uint32_t status;
+		unsigned long atime; /* last access time in jiffies */
+		unsigned short upper_hc;
+		unsigned short flags;
+		rwlock_t rwlock;
+	}  ____cacheline_aligned_in_smp;
+	int bb;
+	int cb;
 	struct llist_head pending_list; /* readahead, dirty log */
-	rwlock_t rwlock;
 };
+
 enum sci_state {
 	SCI_READAHEAD = 0,
 	SCI_CLEAN,
@@ -106,13 +110,11 @@ enum sci_state {
 	SCI_RECLAIMING,
 };
 
-#define SC_CACHE_INFO_STATE(i) (i & 0x3)
-#define SC_CACHE_INFO_INFLIGHT(i) ((i & 0xffffffff) >> 2)
-#define SC_CACHE_INFO_LAST(i) (i >> 48)
-#define SC_CACHE_INFO_AVG(i) ((i >> 32) & 0xffff)
-#define SC_CACHE_INFO(l, a, f, s) \
-	(((uint64_t)l << 48) | (((uint64_t)a << 32) & 0xffff) | \
-	 ((f & 0xffffffff) << 2) | s)
+#define SCI_STATE(i) (i & 0x3)
+#define SCI_INFLIGHT(i) ((i & 0x3fffff) >> 2)
+#define SCI_HIT_COUNT(i) (i >> 22)
+#define SCI(a, f, s) \
+	(((a & 0x3ff) << 22) | ((f & 0xfffff) << 2) | s)
 
 static inline void sci_read_lock(struct sc_cache_info *sci)
 {
@@ -216,7 +218,7 @@ struct sc_io {
 	struct bio *front_bio;
 	struct sc_cache_info *sci;
 	int start_time;
-	struct llist_node node; /* for readahead wait */
+	struct llist_node node;
 	bool started;
 };
 

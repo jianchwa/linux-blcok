@@ -366,7 +366,7 @@ static void sc_rc_sm(struct sc_rc_io *rcio)
 		 * Handle pending list
 		 */
 		sc_handle_pending_list(rcio->sci);
-		WRITE_ONCE(rcio->sci->status, SC_CACHE_INFO(0, 0, 0, SCI_READAHEAD));
+		WRITE_ONCE(rcio->sci->status, SCI(0, 0, SCI_READAHEAD));
 		sc_block_free(rcio->scbd, rcio->cb);
 		sc_free_rcio(rcio);
 		break;
@@ -420,23 +420,31 @@ static void sc_reclaim_one(struct sc_backing_dev *scbd,
  */
 static bool sc_should_reclaim(struct sc_cache_info *sci)
 {
-	uint16_t last, now;
-	uint64_t data = READ_ONCE(sci->status);
-	enum sci_state state = SC_CACHE_INFO_STATE(data);
-
+	uint32_t data = READ_ONCE(sci->status);
+	enum sci_state state = SCI_STATE(data);
+	unsigned long atime;
+	int hit;
 	/*
 	 * We can only reclaim CLEAN and DIRTY entries
 	 */
 	if (state != SCI_CLEAN && state != SCI_DIRTY)
 		return false;
-#if 0
-	now = (uint16_t)jiffies;
-	last = SC_CACHE_INFO_LAST(READ_ONCE(sci->status));
 
-	if (now > last + SC_CACHE_TIMEOUT)
+	atime = READ_ONCE(sci->atime);
+	hit = SCI_HIT_COUNT(data) + sci->upper_hc << 10;
+
+	if (time_after(jiffies, atime + (SC_CACHE_RECLAIM_INTERVAL)) &&
+		hit < 2)
 		return true;
-#endif
-	return true;
+
+	if (time_after(jiffies, atime + (SC_CACHE_RECLAIM_INTERVAL * 2)) &&
+		sci->upper_hc < 1)
+		return true;
+
+	if (time_after(jiffies, atime + (SC_CACHE_RECLAIM_INTERVAL * 3)))
+		return true;
+
+	return false;
 }
 
 static void sc_reclaim(struct sc_backing_dev *scbd)
@@ -484,41 +492,21 @@ static void sc_writeback_endio(struct bio *clone)
 	free_sc_io(sio);
 }
 
-static bool sc_cache_clean(struct sc_cache_info *sci)
-{
-	uint64_t new, old, res;
-
-	old = READ_ONCE(sci->status);
-	while (1) {
-		if (SC_CACHE_INFO_INFLIGHT(old))
-			return false;
-
-		new = SC_CACHE_INFO(SC_CACHE_INFO_LAST(old),
-							SC_CACHE_INFO_AVG(old),
-							SC_CACHE_INFO_INFLIGHT(old),
-							SCI_CLEAN);
-		res = cmpxchg(&sci->status, old, new);
-		if (old == res)
-			return true;
-		old = res;
-	}
-}
-
 static bool sc_cache_reclaim(struct sc_cache_info *sci, bool *dirty)
 {
-	uint64_t new, old, res;
+	uint32_t new, old, res;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
-		if (SC_CACHE_INFO_INFLIGHT(old)) {
+		if (SCI_INFLIGHT(old)) {
 			trace_printk("cb %x if %x\n",
 					sci->cb,
-					(int)SC_CACHE_INFO_INFLIGHT(old));
+					SCI_INFLIGHT(old));
 			return false;
 		}
 
-		new = SC_CACHE_INFO(0, 0, 0, SCI_RECLAIMING);
-		*dirty = SC_CACHE_INFO_STATE(old) == SCI_DIRTY;
+		new = SCI(0, 0, SCI_RECLAIMING);
+		*dirty = SCI_STATE(old) == SCI_DIRTY;
 		res = cmpxchg(&sci->status, old, new);
 		if (old == res)
 			break;
@@ -530,30 +518,29 @@ static bool sc_cache_reclaim(struct sc_cache_info *sci, bool *dirty)
 
 static unsigned long sc_calc_complete(uint64_t old)
 {
-	uint64_t last, avg, inflight;
+	int hit, inflight;
 	enum sci_state state;
 
 	/*
 	 * Dirty state will be set by sc_dirty_log_done
 	 */
-	state = SC_CACHE_INFO_STATE(old);
-	last = SC_CACHE_INFO_LAST(old);
-	avg = SC_CACHE_INFO_AVG(old);
-	inflight = SC_CACHE_INFO_INFLIGHT(old);
+	state = SCI_STATE(old);
+	hit = SCI_HIT_COUNT(old);
+	inflight = SCI_INFLIGHT(old);
 	inflight--;
 
-	return SC_CACHE_INFO(last, avg, inflight, state);
+	return SCI(hit, inflight, state);
 }
 
 static void sc_cache_complete(struct sc_cache_info *sci)
 {
-	uint64_t old, new, res;
+	uint32_t old, new, res;
 
 	old = READ_ONCE(sci->status);
 
-	if (SC_CACHE_INFO_STATE(old) == SCI_RECLAIMING ||
-		SC_CACHE_INFO_STATE(old) == SCI_READAHEAD) {
-		WARN(1, "Wrong sci state %d\n", (int)SC_CACHE_INFO_STATE(old));
+	if (SCI_STATE(old) == SCI_RECLAIMING ||
+		SCI_STATE(old) == SCI_READAHEAD) {
+		WARN(1, "Wrong sci state %s\n", sci_state_strings[SCI_STATE(old)]);
 		return;
 	}
 
@@ -563,7 +550,7 @@ static void sc_cache_complete(struct sc_cache_info *sci)
 		if (old == res) {
 			trace_printk("ended cb %x if %x\n",
 					sci->cb,
-					(int)SC_CACHE_INFO_INFLIGHT(old));
+					SCI_INFLIGHT(old));
 			break;
 		}
 		old = res;
@@ -572,13 +559,11 @@ static void sc_cache_complete(struct sc_cache_info *sci)
 
 static unsigned long sc_calc_dirty(uint64_t old)
 {
-	uint64_t last, avg, inflight;
+	int hit, inflight;
 
-	last = SC_CACHE_INFO_LAST(old);
-	avg = SC_CACHE_INFO_AVG(old);
-	inflight = SC_CACHE_INFO_INFLIGHT(old);
-
-	return SC_CACHE_INFO(last, avg, inflight, SCI_DIRTY);
+	inflight = SCI_INFLIGHT(old);
+	hit = SCI_HIT_COUNT(old);
+	return SCI(hit, inflight, SCI_DIRTY);
 }
 
 /*
@@ -586,11 +571,11 @@ static unsigned long sc_calc_dirty(uint64_t old)
  */
 static void sc_cache_dirty(struct sc_cache_info *sci)
 {
-	uint64_t old, new, res;
+	uint32_t old, new, res;
 
 	old = READ_ONCE(sci->status);
 
-	WARN_ON(SC_CACHE_INFO_STATE(old) != SCI_CLEAN);
+	WARN_ON(SCI_STATE(old) != SCI_CLEAN);
 
 	while (1) {
 		new = sc_calc_dirty(old);
@@ -603,49 +588,37 @@ static void sc_cache_dirty(struct sc_cache_info *sci)
 
 static unsigned long sc_calc_start(uint64_t old)
 {
-	uint32_t now, last, avg, inv, inflight;
+	int hit, inflight;
 	enum sci_state state;
 
-	now = jiffies;
-	last = SC_CACHE_INFO_LAST(old);
-	inflight = SC_CACHE_INFO_INFLIGHT(old);
-	avg = SC_CACHE_INFO_AVG(old);
-	state = SC_CACHE_INFO_STATE(old);
-	if (last) {
-		inv = now - last;
-		if (avg) {
-			avg *= 8;
-			avg += inv;
-			avg /= 8;
-		} else {
-			avg = inv;
-		}
-	}
-	last = now;
+	inflight = SCI_INFLIGHT(old);
+	state = SCI_STATE(old);
+	hit = SCI_HIT_COUNT(old);
 	inflight++;
+	hit++;
 
-	return SC_CACHE_INFO(last, avg, inflight, state);
+	return SCI(hit, inflight, state);
 }
 
 static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started)
 {
-	uint64_t old, new, res;
+	uint32_t old, new, res;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
 		trace_printk("try start cb %x if %x s %s %d\n",
 				sci->cb,
-				(int)SC_CACHE_INFO_INFLIGHT(old),
-				sci_state_strings[SC_CACHE_INFO_STATE(old)],
+				SCI_INFLIGHT(old),
+				sci_state_strings[SCI_STATE(old)],
 				started);
 
-		if (unlikely(SC_CACHE_INFO_STATE(old) == SCI_RECLAIMING))
+		if (unlikely(SCI_STATE(old) == SCI_RECLAIMING))
 			return SCI_RECLAIMING;
 
 		/*
 		 * cblock under SCI_READAHEAD will not be reclaimed.
 		 */
-		if (SC_CACHE_INFO_STATE(old) == SCI_READAHEAD)
+		if (SCI_STATE(old) == SCI_READAHEAD)
 			return SCI_READAHEAD;
 
 		/*
@@ -653,15 +626,11 @@ static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started)
 		 * accounted as sci in-flight, so needn't account them again.
 		 */
 		if (started)
-			return SC_CACHE_INFO_STATE(old);
+			return SCI_STATE(old);
 
 		new = sc_calc_start(old);
 		/*
-		 * May race with GC reclaim or concurrent submits and completions.
-		 *
-		 * FIXME:
-		 *   Why does cmpxchg always tries two times even if no one races with
-		 *   it ?
+		 * May race with reclaim or concurrent submits and completions.
 		 */
 		res = cmpxchg(&sci->status, old, new);
 		/*
@@ -670,8 +639,11 @@ static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started)
 		if (old == res) {
 			trace_printk("started cb %x if %x\n",
 					sci->cb,
-					(int)SC_CACHE_INFO_INFLIGHT(old));
-			return SC_CACHE_INFO_STATE(old);
+					(int)SCI_INFLIGHT(old));
+			sci->atime = jiffies;
+			if (SCI_HIT_COUNT(new) == 0)
+				sci->upper_hc++;
+			return SCI_STATE(old);
 		}
 		old = res;
 	}
@@ -797,7 +769,7 @@ static void sc_ra_complete(struct sc_ra_io *raio)
 	/*
 	 * Setup a clean cache entry after readahead
 	 */
-	data = 	SC_CACHE_INFO(0, 0, 0, SCI_CLEAN);
+	data = 	SCI(0, 0, SCI_CLEAN);
 	WRITE_ONCE(sci->status, data);
 	/*
 	 * sci_read_lock
@@ -948,6 +920,9 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 	cblock = sc_get_mapping_entry(scbd, offset);
 	if (cblock <= 0) {
 		/* 1. last part which is smaller than block size
+		 *    when the front device is created, the caching
+		 *    device has not been attached, so we cannot
+		 *    know the block size and do round_down.
 		 * 2. no cache space currently
 		 *    FIXME:
 		 *      This is not a good way.
@@ -1665,6 +1640,7 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 	int sci_per_page;
 	sector_t caching_size = part_nr_sects_read(scbd->caching_dev->bd_part);
 	struct sc_cache_info *sci;
+	int now;
 
 	mt_to = (3 * sb->maplen) + PAGE_SIZE;
 	mt_to = round_up(mt_to, sb->block_size);
@@ -1699,12 +1675,13 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 			return -ENOMEM;
 		}
 	}
-
+	now = jiffies;
 	for (i = 0; i < scbd->scis_total; i++) {
 		sci = sc_get_cache_info(scbd, i + scbd->cb_offset);
 		sci->cb = i + scbd->cb_offset;
 		sci->bb = ~0;
-		sci->status = SC_CACHE_INFO(0, 0, 0, SCI_READAHEAD);
+		sci->atime = now;
+		sci->status = SCI(0, 0, SCI_READAHEAD);
 		rwlock_init(&sci->rwlock);
 		init_llist_head(&sci->pending_list);
 	}
@@ -1901,7 +1878,6 @@ static int sc_get_mapping_entry(
 	entry += (block % SC_CACHE_ENTRIES_PER_PAGE);
 retry:
 	data = READ_ONCE(entry->cb);
-	trace_printk("get cb %x %p\n", data, current);
 	if (SC_CACHE_ENTRY_CB(data))
 		return SC_CACHE_ENTRY_CB(data);
 
@@ -2024,7 +2000,7 @@ static int sc_handle_mapping_early(struct sc_backing_dev *scbd)
 					continue;
 				}
 				state = SC_ENTRY_DIRTY(data) ? SCI_DIRTY:SCI_CLEAN;
-				sci->status = SC_CACHE_INFO(0, 0, 0, state);
+				sci->status = SCI(0, 0, state);
 				sci->bb = bblock; /* reverse mapping */
 				sc_cache_entry_set(sb, bblock, cblock);
 			}
@@ -2486,20 +2462,26 @@ static ssize_t sc_bd_stop_store(struct sc_backing_dev *scbd,
 	return len;
 }
 
+/*
+ * FIXME:
+ *
+ * There is no protect against the cache stop
+ */
 static ssize_t sc_bd_map_show(struct sc_backing_dev *scbd, char *buf)
 {
 	unsigned long i = scbd->cb_offset;
 	struct sc_cache_info *sci;
 
+	printk("SC: dump valid mapping entries at jiffies %ld\n", jiffies);
 	for (; i < scbd->scis_total; i++) {
 		sci = sc_get_cache_info(scbd, i);
-		if (SC_CACHE_INFO_STATE(sci->status))
-			printk("[%lx -> %llx]: avg %d la %d if %d s %s\n",
-				i, sci->bb,
-				(int)SC_CACHE_INFO_AVG(sci->status),
-				(int)SC_CACHE_INFO_LAST(sci->status),
-				(int)SC_CACHE_INFO_INFLIGHT(sci->status),
-				sci_state_strings[SC_CACHE_INFO_STATE(sci->status)]);
+		if (SCI_STATE(sci->status))
+			printk("[%x -> %x]: ac %d at %d if %d s %s\n",
+				sci->cb, sci->bb,
+				SCI_HIT_COUNT(sci->status),
+				sci->atime,
+				SCI_INFLIGHT(sci->status),
+				sci_state_strings[SCI_STATE(sci->status)]);
 	}
 	return 0;
 }
