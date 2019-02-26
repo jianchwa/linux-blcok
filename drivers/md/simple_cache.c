@@ -67,6 +67,9 @@ static void sc_handle_pending_list(struct sc_cache_info *sci);
 static void sc_rc_sm(struct sc_rc_io *rcio);
 static void sc_block_free(struct sc_backing_dev *scbd, int block);
 static bool sc_cache_reclaim(struct sc_cache_info *sci, bool *dirty);
+static bool sc_cache_clean(struct sc_cache_info *sci, bool ing);
+static void sc_cache_dirty(struct sc_cache_info *sci);
+static void sc_rc_run_sm(struct sc_rc_io *rcio);
 
 struct sc_multi_io {
 	atomic_t bios;
@@ -213,7 +216,149 @@ static void sc_rc_endio(struct bio *bio)
 {
 	struct sc_rc_io *rcio = bio->bi_private;
 
-	queue_work(sc_workqueue, &rcio->async_work);
+	sc_rc_run_sm(rcio);
+}
+
+static void sc_rc_writeback_endio(struct bio *bio)
+{
+	struct sc_rc_io *rcio = bio->bi_private;
+	struct sc_backing_dev *scbd = rcio->scbd;
+	unsigned long flags;
+
+	spin_lock_irqsave(&scbd->wb_lock, flags);
+	if (!list_empty_careful(&scbd->wb_pending))
+		queue_work(sc_workqueue, &scbd->wb_work);
+	spin_unlock_irqrestore(&scbd->wb_lock, flags);
+
+	sc_rc_endio(bio);
+}
+
+static void sc_rc_writeback(struct sc_rc_io *rcio)
+{
+	struct sc_backing_dev *scbd = rcio->scbd;
+	struct sc_sb *sb = scbd->sb;
+	struct bio *bio = rcio->bio;
+	int i;
+
+	bio_init(bio, bio->bi_io_vec, rcio->nr);
+	bio->bi_iter.bi_sector = rcio->bb << sb->bitsbsz2sc;
+	bio_set_dev(bio, scbd->backing_dev);
+	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_FUA);
+	for (i = 0; i < rcio->nr; i++)
+		bio_add_page(bio, rcio->pages[i], PAGE_SIZE, 0);
+	bio->bi_private = rcio;
+	bio->bi_end_io = sc_rc_writeback_endio;
+
+	submit_bio(bio);
+}
+
+static void sc_wb_work(struct work_struct *work)
+{
+	struct sc_backing_dev *scbd = container_of(work, struct sc_backing_dev, wb_work);
+	unsigned long flags;
+	struct sc_rc_io *rcio;
+
+	if (list_empty_careful(&scbd->wb_pending))
+		return;
+
+	spin_lock_irqsave(&scbd->wb_lock, flags);
+	if (list_empty_careful(&scbd->wb_pending)) {
+		spin_unlock_irqrestore(&scbd->wb_lock, flags);
+		return;
+	}
+	/*
+	 * Need some heuristic to decide submit one by one or
+	 * submit all.
+	 */
+	rcio = list_first_entry(&scbd->wb_pending, struct sc_rc_io, wblist);
+	list_del_init(&rcio->wblist);
+	spin_unlock_irqrestore(&scbd->wb_lock, flags);
+
+	sc_rc_writeback(rcio);
+	return;
+}
+
+static void sc_interrupt_wb(struct sc_backing_dev *scbd, struct sc_cache_info *sci)
+{
+	struct sc_rc_io *rcio = READ_ONCE(sci->wb_rcio);
+	unsigned long flags;
+
+	if (!rcio)
+	    return;
+
+	WRITE_ONCE(sci->wb_rcio, NULL);
+
+	/*
+	 * The spin lock operations act as a pair of memory barrier
+	 * between sc_interrupt_wb and sc_wb_queue
+	 */
+	spin_lock_irqsave(&scbd->wb_lock, flags);
+	/*
+	 * Not empty, so have not been handled
+	 */
+	if (!list_empty_careful(&rcio->wblist))
+	    list_del_init(&rcio->wblist);
+	spin_unlock_irqrestore(&scbd->wb_lock, flags);
+
+	rcio->state = SC_RC_COMPLETE;
+	sc_rc_run_sm(rcio);
+}
+
+static void sc_wb_queue(struct sc_rc_io *rcio)
+{
+	struct sc_backing_dev *scbd = rcio->scbd;
+	struct sc_rc_io *pos;
+	unsigned long flags;
+	bool queue = false;
+
+	spin_lock_irqsave(&scbd->wb_lock, flags);
+
+	if (list_empty_careful(&scbd->wb_pending))
+		queue = true;
+
+	list_for_each_entry(pos, &scbd->wb_pending, wblist)
+		if (pos->sci->bb > rcio->sci->bb)
+			break;
+
+	list_add_tail(&rcio->wblist, &pos->wblist);
+	spin_unlock_irqrestore(&scbd->wb_lock, flags);
+	WRITE_ONCE(rcio->sci->wb_rcio, rcio);
+	if (queue)
+		queue_work(sc_workqueue, &scbd->wb_work);
+}
+
+static void sc_rc_run_sm(struct sc_rc_io *rcio)
+{
+	switch (rcio->state) {
+		/*
+		 * Running in reclaim work context
+		 */
+	case SC_RC_RD:
+		/*
+		 * Running in irq completion context, but
+		 * the action is safe in irq mode
+		 */
+	case SC_RC_WB:
+		sc_rc_sm(rcio);
+		break;
+		/*
+		 * IO completion context
+		 */
+	case SC_RC_LOG:
+		/*
+		 * Running in log insert work context.
+		 * To handle log insert faster, queue to work
+		 * queue context.
+		 *
+		 * And also sc_interrupt_wb use this.
+		 */
+	case SC_RC_COMPLETE:
+		queue_work(sc_workqueue, &rcio->async_work);
+		break;
+	default:
+		WARN_ON(1);
+		break;
+	}
 }
 
 static void sc_rc_read_cache(struct sc_rc_io *rcio)
@@ -237,33 +382,12 @@ static void sc_rc_read_cache(struct sc_rc_io *rcio)
 	submit_bio(bio);
 }
 
-static void sc_rc_write_back(struct sc_rc_io *rcio)
-{
-	struct sc_backing_dev *scbd = rcio->scbd;
-	struct sc_sb *sb = scbd->sb;
-	struct bio *bio = rcio->bio;
-	int i;
-
-	bio_init(bio, bio->bi_io_vec, rcio->nr);
-	bio->bi_iter.bi_sector = rcio->bb << sb->bitsbsz2sc;
-	bio_set_dev(bio, scbd->backing_dev);
-	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_FUA);
-	for (i = 0; i < rcio->nr; i++)
-		bio_add_page(bio, rcio->pages[i], PAGE_SIZE, 0);
-	bio->bi_private = rcio;
-	bio->bi_end_io = sc_rc_endio;
-
-	rcio->state = SC_RC_LOG; /* next step */
-
-	submit_bio(bio);
-}
-
 /*
  * kworker task context
  */
 static void sc_rc_log_done(void *data)
 {
-	sc_rc_sm(data);
+	sc_rc_run_sm(data);
 }
 
 static void sc_rc_log(struct sc_rc_io *rcio)
@@ -276,45 +400,39 @@ static void sc_rc_log(struct sc_rc_io *rcio)
 	 */
 	sli = kmalloc(sizeof(*sli), GFP_NOIO);
 	sli->sl = &rcio->scbd->sb->log;
-	sli->op = SC_LOG_OP_MAP_CLEAN;
+
+	if (rcio->action == SC_RCA_CLEAN)
+		sli->op = SC_LOG_OP_DIRTY_CLEAN;
+	else if (rcio->action == SC_RCA_RECLAIM)
+		sli->op = SC_LOG_OP_MAP_CLEAN;
+
 	sli->cb = rcio->cb;
 	sli->bb = ~0;
 	sli->log_done = sc_rc_log_done;
 	sli->private = rcio;
 
-	rcio->state = SC_RC_CLEAN_MAPPING; /* next step */
+	rcio->state = SC_RC_COMPLETE; /* next step */
 
 	sc_log_insert(sli);
 }
 
-static void sc_rc_rcu_clean_mapping(struct rcu_head *rcu)
+static void sc_drain_rcio(struct sc_backing_dev *scbd)
 {
-	struct sc_rc_io *rcio = container_of(rcu, struct sc_rc_io, rcu);
-
-	rcio->state = SC_RC_COMPLETE;
-	queue_work(sc_workqueue, &rcio->async_work);
-}
-
-static void sc_rc_clean_mapping(struct sc_rc_io *rcio)
-{
-	struct sc_backing_dev *scbd = rcio->scbd;
-	struct sc_sb *sb = scbd->sb;
-	struct sc_cache_info *sci = rcio->sci;
-	struct sc_cache_entry *entry;
-
-	entry = sb->mappings[sci->bb / SC_CACHE_ENTRIES_PER_PAGE];
-	entry += (sci->bb % SC_CACHE_ENTRIES_PER_PAGE);
-
-	WRITE_ONCE(entry->cb, 0);
-	/*
-	 * Ensure the write above is visible
-	 */
-	call_rcu(&rcio->rcu, sc_rc_rcu_clean_mapping);
+	while (atomic_read(&scbd->rcio_running)) {
+		wait_event_timeout(scbd->rcio_wait,
+				!atomic_read(&scbd->rcio_running),
+				(5 * HZ));
+	}
 }
 
 static void sc_free_rcio(struct sc_rc_io *rcio)
 {
+	struct sc_backing_dev *scbd = rcio->scbd;
 	int i;
+
+	if (atomic_dec_return(&scbd->rcio_running) == 0 &&
+	    waitqueue_active(&scbd->rcio_wait))
+	    wake_up(&scbd->rcio_wait);
 
 	for (i = 0; i < rcio->nr; i++)
 		put_page(rcio->pages[i]);
@@ -324,20 +442,59 @@ static void sc_free_rcio(struct sc_rc_io *rcio)
 		kfree(rcio->pages);
 	kfree(rcio);
 }
+
+static void sc_rc_complete(struct sc_rc_io *rcio)
+{
+	sc_cache_clean(rcio->sci, false);
+	sci_sync(rcio->sci);
+	sc_handle_pending_list(rcio->sci);
+#if 0
+	WRITE_ONCE(rcio->sci->status, SCI(0, 0, SCI_READAHEAD));
+	sc_block_free(rcio->scbd, rcio->cb);
+#endif
+	sc_free_rcio(rcio);
+}
+
+static void sc_rc_interrupted(struct sc_rc_io *rcio)
+{
+	switch (rcio->action) {
+	case SC_RCA_CLEAN:
+		sc_cache_dirty(rcio->sci);
+		break;
+	case SC_RCA_RECLAIM:
+		break;
+	default:
+		WARN_ON(1);
+		break;
+	}
+
+	sci_sync(rcio->sci);
+	sc_handle_pending_list(rcio->sci);
+	sc_free_rcio(rcio);
+}
+
 /*
  * TODO
  *   reclaim process could be interrupted
  */
 static void sc_rc_sm(struct sc_rc_io *rcio)
 {
+	bool interrupt = false;
+
 	trace_printk("rc bb %lx cb %lx %s\n",
 			rcio->bb, rcio->cb, sc_rc_state_strings[rcio->state]);
+
+	if (!llist_empty(&rcio->sci->pending_list))
+		interrupt = true;
+
 	switch(rcio->state) {
 	case SC_RC_RD:
 		/*
 		 * Read in the dirty cache
 		 * Interruptible
 		 */
+		if (interrupt)
+			goto intr;
 		sc_rc_read_cache(rcio);
 		break;
 	case SC_RC_WB:
@@ -345,35 +502,39 @@ static void sc_rc_sm(struct sc_rc_io *rcio)
 		 * Writeback the dirty cache
 		 * Interruptible
 		 */
-		sc_rc_write_back(rcio);
+		if (interrupt)
+			goto intr;
+		/*
+		 * It seems that the writeback here could cause
+		 * large amount of IO which could block the ra IO
+		 */
+		rcio->state = SC_RC_LOG; /* next step */
+		sc_wb_queue(rcio);
 		break;
 	case SC_RC_LOG:
 		/*
-		 * mapping clean log
+		 * dirty clean / mapping clean log
 		 * Interruptible
 		 */
+		if (interrupt)
+			goto intr;
 		sc_rc_log(rcio);
-		break;
-	case SC_RC_CLEAN_MAPPING:
-		/*
-		 * Free the cb
-		 * Interruptible
-		 */
-		sc_rc_clean_mapping(rcio);
 		break;
 	case SC_RC_COMPLETE:
 		/*
 		 * Handle pending list
 		 */
-		sc_handle_pending_list(rcio->sci);
-		WRITE_ONCE(rcio->sci->status, SCI(0, 0, SCI_READAHEAD));
-		sc_block_free(rcio->scbd, rcio->cb);
-		sc_free_rcio(rcio);
+		sc_rc_complete(rcio);
 		break;
 	default:
 		WARN_ON(1);
 		break;
 	}
+
+	return;
+intr:
+	sc_rc_interrupted(rcio);
+	return;
 }
 
 static void sc_rc_async_work(struct work_struct *work)
@@ -384,7 +545,7 @@ static void sc_rc_async_work(struct work_struct *work)
 }
 
 static void sc_reclaim_one(struct sc_backing_dev *scbd,
-		struct sc_cache_info *sci, bool dirty)
+		struct sc_cache_info *sci, enum sc_rc_action action)
 {
 	struct sc_rc_io *rcio;
 	int nr, i;
@@ -395,9 +556,11 @@ static void sc_reclaim_one(struct sc_backing_dev *scbd,
 	rcio->bb = sci->bb;
 	rcio->cb = sci->cb;
 	rcio->bio = NULL;
+	rcio->action = action;
 	INIT_WORK(&rcio->async_work, sc_rc_async_work);
+	INIT_LIST_HEAD(&rcio->wblist);
 
-	if (dirty) {
+	if (action == SC_RCA_CLEAN) {
 		nr = scbd->sb->block_size / PAGE_SIZE;
 		rcio->pages = kmalloc(sizeof(void *) * nr, GFP_NOIO);
 		for (i = 0; i < nr; i++) {
@@ -412,56 +575,62 @@ static void sc_reclaim_one(struct sc_backing_dev *scbd,
 		rcio->state = SC_RC_LOG;
 	}
 
-	queue_work(sc_workqueue, &rcio->async_work);
+	atomic_inc(&scbd->rcio_running);
+	sc_rc_run_sm(rcio);
 }
 
 /*
  * This is the very core algorithm
  */
-static bool sc_should_reclaim(struct sc_cache_info *sci)
+static enum sc_rc_action sc_should_reclaim(struct sc_cache_info *sci)
 {
 	uint32_t data = READ_ONCE(sci->status);
 	enum sci_state state = SCI_STATE(data);
 	unsigned long atime;
 	int hit;
 	/*
-	 * We can only reclaim CLEAN and DIRTY entries
+	 * Just write out the DIRTY blocks
 	 */
-	if (state != SCI_CLEAN && state != SCI_DIRTY)
-		return false;
+	if (state == SCI_DIRTY) {
 
-	atime = READ_ONCE(sci->atime);
-	hit = SCI_HIT_COUNT(data) + sci->upper_hc << 10;
+		atime = READ_ONCE(sci->atime);
+		hit = SCI_HIT_COUNT(data) + (sci->upper_hc << 10);
 
-	if (time_after(jiffies, atime + (SC_CACHE_RECLAIM_INTERVAL)) &&
-		hit < 2)
-		return true;
+		if (time_after(jiffies, atime + (SC_CACHE_RECLAIM_INTERVAL)) &&
+			hit < 2)
+			return SC_RCA_CLEAN;
 
-	if (time_after(jiffies, atime + (SC_CACHE_RECLAIM_INTERVAL * 2)) &&
-		sci->upper_hc < 1)
-		return true;
+		if (time_after(jiffies, atime + (SC_CACHE_RECLAIM_INTERVAL * 2)) &&
+			sci->upper_hc < 1)
+			return SC_RCA_CLEAN;
 
-	if (time_after(jiffies, atime + (SC_CACHE_RECLAIM_INTERVAL * 3)))
-		return true;
+		if (time_after(jiffies, atime + (SC_CACHE_RECLAIM_INTERVAL * 3)))
+			return SC_RCA_CLEAN;
+	}
 
-	return false;
+	return SC_RCA_NOP;
 }
 
 static void sc_reclaim(struct sc_backing_dev *scbd)
 {
 	int i;
 	struct sc_cache_info *sci;
-	bool dirty;
 
 	for (i = 0; i < scbd->scis_total; i ++) {
 		sci = sc_get_cache_info(scbd, i + scbd->cb_offset);
-		if (!sc_should_reclaim(sci))
-			continue;
-
-		if (!sc_cache_reclaim(sci, &dirty))
-			continue;
-
-		sc_reclaim_one(scbd, sci, dirty);
+		switch (sc_should_reclaim(sci)) {
+		case SC_RCA_NOP:
+			break;
+		case SC_RCA_CLEAN:
+			if (sc_cache_clean(sci, true))
+				sc_reclaim_one(scbd, sci, SC_RCA_CLEAN);
+			break;
+		case SC_RCA_RECLAIM:
+			break;
+		default:
+			WARN_ON(1);
+			break;
+		}
 	}
 }
 
@@ -490,6 +659,51 @@ static void sc_writeback_endio(struct bio *clone)
 	bio->bi_status = clone->bi_status;
 	bio_endio(bio);
 	free_sc_io(sio);
+}
+
+static unsigned long sc_calc_clean(uint64_t old, bool ing)
+{
+	int hit, inflight;
+	enum sci_state state;
+
+	/*
+	 * Inflight must be 0 for CLEANING
+	 */
+	hit = SCI_HIT_COUNT(old);
+	if (ing) {
+		state = SCI_CLEANING;
+		inflight = 0;
+	} else {
+		/*
+		 * There could be read IO inflight with CLEANING in parallel.
+		 */
+		inflight = SCI_INFLIGHT(old);
+		state = SCI_CLEAN;
+	}
+	return SCI(hit, inflight, state);
+}
+
+static bool sc_cache_clean(struct sc_cache_info *sci, bool ing)
+{
+	uint32_t new, old, res;
+
+	old = READ_ONCE(sci->status);
+	while (1) {
+		if (SCI_INFLIGHT(old)) {
+			trace_printk("cb %x if %x\n",
+					sci->cb,
+					SCI_INFLIGHT(old));
+			return false;
+		}
+
+		new = sc_calc_clean(old, ing);
+		res = cmpxchg(&sci->status, old, new);
+		if (old == res)
+			break;
+		old = res;
+	}
+
+	return true;
 }
 
 static bool sc_cache_reclaim(struct sc_cache_info *sci, bool *dirty)
@@ -575,8 +789,6 @@ static void sc_cache_dirty(struct sc_cache_info *sci)
 
 	old = READ_ONCE(sci->status);
 
-	WARN_ON(SCI_STATE(old) != SCI_CLEAN);
-
 	while (1) {
 		new = sc_calc_dirty(old);
 		res = cmpxchg(&sci->status, old, new);
@@ -600,7 +812,7 @@ static unsigned long sc_calc_start(uint64_t old)
 	return SCI(hit, inflight, state);
 }
 
-static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started)
+static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started, bool w)
 {
 	uint32_t old, new, res;
 
@@ -612,8 +824,11 @@ static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started)
 				sci_state_strings[SCI_STATE(old)],
 				started);
 
-		if (unlikely(SCI_STATE(old) == SCI_RECLAIMING))
-			return SCI_RECLAIMING;
+		/*
+		 * Write cannot be ongoing with write IO
+		 */
+		if (unlikely(SCI_STATE(old) == SCI_CLEANING && w))
+			return SCI_CLEANING;
 
 		/*
 		 * cblock under SCI_READAHEAD will not be reclaimed.
@@ -916,7 +1131,6 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 				bio->bi_iter.bi_sector, bio_end_sector(bio));
 	}
 
-	rcu_read_lock();
 	cblock = sc_get_mapping_entry(scbd, offset);
 	if (cblock <= 0) {
 		/* 1. last part which is smaller than block size
@@ -928,14 +1142,12 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 		 *      This is not a good way.
 		 *      Please refer to comments in SCI_READAHEAD case
 		 */
-		rcu_read_unlock();
 		pr_warn("passthrough\n");
 		goto passthrough;
 	}
 
 	sci = sc_get_cache_info(scbd, cblock);
 	if (!sci) {
-		rcu_read_unlock();
 		pr_err("NULL sci for cb %x off%lx\n", cblock, offset);
 		bio->bi_status = BLK_STS_IOERR;
 		bio_endio(bio);
@@ -943,11 +1155,13 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 	}
 
 	sci_read_lock(sci);
-	switch (sc_cache_start(sci, sio->started)) {
-	case SCI_RECLAIMING:
+	switch (sc_cache_start(sci, sio->started,
+				op_is_write(bio_op(bio)))) {
+	case SCI_CLEANING:
 		llist_add(&sio->node, &sci->pending_list);
 		sci_read_unlock(sci);
-		rcu_read_unlock();
+		if (READ_ONCE(sci->wb_rcio))
+		    sc_interrupt_wb(scbd, sci);
 		break;
 	case SCI_READAHEAD:
 		/*
@@ -961,7 +1175,6 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 		 * See comments in sc_ra_complete
 		 */
 		sci_read_unlock(sci);
-		rcu_read_unlock();
 		if (first)
 			sc_cache_readahead(scbd, sci, cblock, offset >> sb->bitsbsz2sc);
 		break;
@@ -976,7 +1189,6 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 			 * Same with readahead path
 			 */
 			sci_read_unlock(sci);
-			rcu_read_unlock();
 			if (first)
 				sc_dirty_log(sci, scbd);
 			break;
@@ -989,7 +1201,6 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 		 * cache hit
 		 */
 		sci_read_unlock(sci);
-		rcu_read_unlock();
 		sio->started = true;
 		sio->sci = sci;
 		__bio_clone_fast(clone, bio);
@@ -1682,6 +1893,7 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 		sci->bb = ~0;
 		sci->atime = now;
 		sci->status = SCI(0, 0, SCI_READAHEAD);
+		sci->wb_rcio = NULL;
 		rwlock_init(&sci->rwlock);
 		init_llist_head(&sci->pending_list);
 	}
@@ -2393,11 +2605,8 @@ fail:
 
 static void sc_turndown_cache(struct sc_backing_dev *scbd)
 {
-	/* FIXME:
-	 * We must drain all of the work on reclaim work.
-	 */
 	cancel_delayed_work_sync(&scbd->reclaim_work);
-
+	sc_drain_rcio(scbd);
 	/*
 	 * Drain all of the work in writeback and reclaim path,
 	 * could ensure insert_work to be able to stopped.
@@ -2476,7 +2685,7 @@ static ssize_t sc_bd_map_show(struct sc_backing_dev *scbd, char *buf)
 	for (; i < scbd->scis_total; i++) {
 		sci = sc_get_cache_info(scbd, i);
 		if (SCI_STATE(sci->status))
-			printk("[%x -> %x]: ac %d at %d if %d s %s\n",
+			printk("[%x -> %x]: ac %d at %ld if %d s %s\n",
 				sci->cb, sci->bb,
 				SCI_HIT_COUNT(sci->status),
 				sci->atime,
@@ -2643,6 +2852,11 @@ static int sc_backing_init(struct sc_backing_dev *scbd)
 	sc_backing_dev_add(scbd);
 
 	INIT_DELAYED_WORK(&scbd->reclaim_work, sc_reclaim_work);
+	spin_lock_init(&scbd->wb_lock);
+	INIT_LIST_HEAD(&scbd->wb_pending);
+	INIT_WORK(&scbd->wb_work, sc_wb_work);
+	atomic_set(&scbd->rcio_running, 0);
+	init_waitqueue_head(&scbd->rcio_wait);
 
 	return 0;
 fail_link_holder:

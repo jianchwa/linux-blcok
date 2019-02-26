@@ -34,15 +34,21 @@ enum sc_cache_mode {
 
 #define SC_CACHE_RECLAIM_INTERVAL (10 * HZ)
 
+enum sc_rc_action {
+	SC_RCA_NOP,
+	SC_RCA_CLEAN,
+	SC_RCA_RECLAIM,
+};
+
 enum sc_rc_state {
 	SC_RC_RD = 0,
 	SC_RC_WB,
 	SC_RC_LOG,
-	SC_RC_CLEAN_MAPPING,
 	SC_RC_COMPLETE,
 };
 
 struct sc_rc_io {
+	struct list_head wblist;
 	struct sc_cache_info *sci;
 	struct sc_backing_dev *scbd;
 	unsigned long bb, cb;
@@ -50,8 +56,8 @@ struct sc_rc_io {
 	struct bio *bio;
 	int nr;
 	enum sc_rc_state state;
+	enum sc_rc_action action;
 	struct work_struct async_work;
-	struct rcu_head rcu;
 };
 
 enum sc_ra_state {
@@ -78,17 +84,16 @@ struct sc_ra_io {
  * |----|-------- -|-|
  *
  * 31:22    access count
- * 21:2     in-flight IO (1 million IO at the same time is enougth )
- * 1:0 		state
+ * 21:3     in-flight IO (512K IO at the same time is enougth )
+ * 2:0 		state
  *
  * 0 		readahead
  * 1 		clean
  * 2 		dirty
- * 3 		reclaiming
+ * 3 		cleaning
+ * 4 		reclaiming
  *
  */
-
-#define SCI_FLAG_HC_UPPER(f) (f & 0xffff)
 
 struct sc_cache_info {
 	struct {
@@ -100,6 +105,9 @@ struct sc_cache_info {
 	}  ____cacheline_aligned_in_smp;
 	int bb;
 	int cb;
+	struct sc_rc_io *wb_rcio; /* for interrupt the wb and
+				     the size of sc_cache_info is
+				     added again, this is not good*/
 	struct llist_head pending_list; /* readahead, dirty log */
 };
 
@@ -107,14 +115,15 @@ enum sci_state {
 	SCI_READAHEAD = 0,
 	SCI_CLEAN,
 	SCI_DIRTY,
+	SCI_CLEANING,
 	SCI_RECLAIMING,
 };
 
-#define SCI_STATE(i) (i & 0x3)
-#define SCI_INFLIGHT(i) ((i & 0x3fffff) >> 2)
+#define SCI_STATE(i) (i & 0x7)
+#define SCI_INFLIGHT(i) ((i & 0x3fffff) >> 3)
 #define SCI_HIT_COUNT(i) (i >> 22)
 #define SCI(a, f, s) \
-	(((a & 0x3ff) << 22) | ((f & 0xfffff) << 2) | s)
+	(((a & 0x3ff) << 22) | ((f & 0x7ffff) << 3) | s)
 
 static inline void sci_read_lock(struct sc_cache_info *sci)
 {
@@ -193,6 +202,15 @@ struct sc_backing_dev {
 	unsigned long cb_offset;
 	wait_queue_head_t wait_invalidate;
 
+	/*
+	 * TODO
+	 *   Fields about wb and rc should be moved to a separated structure.
+	 */
+	spinlock_t wb_lock;
+	struct list_head wb_pending;
+	struct work_struct wb_work;
+	atomic_t rcio_running; 
+	wait_queue_head_t rcio_wait;
 	struct delayed_work	reclaim_work;
 
 	struct gendisk *front_disk;
