@@ -76,6 +76,12 @@ struct sc_ra_io {
 	int nr;
 	enum sc_ra_state state;
 	struct work_struct async_work;
+	/*
+	 * Record the IOs submited with log in parallel
+	 */
+	struct llist_node *io_list;
+	atomic_t ios;
+	bool write_pending;
 };
 
 /*
@@ -105,10 +111,13 @@ struct sc_cache_info {
 	}  ____cacheline_aligned_in_smp;
 	int bb;
 	int cb;
-	struct sc_rc_io *wb_rcio; /* for interrupt the wb and
-				     the size of sc_cache_info is
-				     added again, this is not good*/
 	struct llist_head pending_list; /* readahead, dirty log */
+	/*
+	 * Employed by two cases:
+	 *  - interrupt the wb, it is a rcio
+	 *  - disorder the log and pending IO during ra, it is a raio 
+	 */
+	void *data;
 };
 
 enum sci_state {
@@ -289,7 +298,8 @@ struct sc_sysfs_entry {
  * 2 		dirty set
  * 3 		drity clear
  * 4        nop
- * 5 ~ 7 	reserved
+ * 5        mapping set and dirty
+ * 6 ~ 7 	reserved
  *
  * The mapping log area is 2 times of mapping entry array.
  * So we have 2 log rings. When one is full, we switch to another one
@@ -356,6 +366,7 @@ typedef struct sc_log sc_log_t;
 #define SC_LOG_OP_DIRTY_SET 2
 #define SC_LOG_OP_DIRTY_CLEAN 3
 #define SC_LOG_OP_NOP 4
+#define SC_LOG_OP_MAP_DIRTY 5
 
 #define SC_LOG_BLOCK_SHIFT 8
 #define SC_LOG_GEN_SHIFT 3

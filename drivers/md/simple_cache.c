@@ -32,7 +32,9 @@ static char *sc_log_op_strings[] = {
 	"MAP_SET",
 	"MAP_CLEAN",
 	"DIRTY_SET",
-	"DIRTY_CLEAN"
+	"DIRTY_CLEAN",
+	"NOP",
+	"MAP_DIRTY",
 };
 
 static char *sci_state_strings[] = {
@@ -53,7 +55,6 @@ static char *sc_rc_state_strings[] = {
 	"READ_DIRTY",
 	"WRITE_CACHE",
 	"LOG",
-	"CLEAN_MAPPING",
 	"COMPLETE"
 };
 
@@ -183,6 +184,26 @@ static int sc_io_init(struct sc_io *sio)
 	return 0;
 }
 
+static blk_qc_t sc_cache_io(struct sc_io *sio,
+		struct sc_cache_info *sci, bio_end_io_t *end_io)
+{
+	struct sc_backing_dev *scbd = sio->scbd;
+	struct sc_sb *sb = scbd->sb;
+	struct bio *clone = &sio->clone;
+	struct bio *bio = sio->front_bio;
+	sector_t offset = bio->bi_iter.bi_sector;
+
+	sio->started = true;
+	sio->sci = sci;
+	__bio_clone_fast(clone, bio);
+	clone->bi_iter.bi_sector = (sci->cb << sb->bitsbsz2sc) + (offset & sb->scblkmask);
+	bio_set_dev(clone, scbd->caching_dev);
+	clone->bi_end_io = end_io;
+	clone->bi_private = sio;
+
+	return submit_bio(clone);
+}
+
 static void sio_passthrough_end(struct bio *clone)
 {
 	struct sc_io *sio = container_of(clone, struct sc_io, clone);
@@ -280,27 +301,34 @@ static void sc_wb_work(struct work_struct *work)
 
 static void sc_interrupt_wb(struct sc_backing_dev *scbd, struct sc_cache_info *sci)
 {
-	struct sc_rc_io *rcio = READ_ONCE(sci->wb_rcio);
+	struct sc_rc_io *rcio = READ_ONCE(sci->data);
 	unsigned long flags;
 
 	if (!rcio)
 	    return;
 
-	WRITE_ONCE(sci->wb_rcio, NULL);
+	WRITE_ONCE(sci->data, NULL);
 
 	/*
+	 * If the rcio is pending on WB list, we steal it
+	 * and complete it ourself, otherwise, let the sc_rc_sm
+	 * handle the interrupt.
 	 * The spin lock operations act as a pair of memory barrier
 	 * between sc_interrupt_wb and sc_wb_queue
 	 */
 	spin_lock_irqsave(&scbd->wb_lock, flags);
-	/*
-	 * Not empty, so have not been handled
-	 */
-	if (!list_empty_careful(&rcio->wblist))
-	    list_del_init(&rcio->wblist);
+	if (list_empty_careful(&rcio->wblist)) {
+		spin_unlock_irqrestore(&scbd->wb_lock, flags);
+		return;
+	}
+	list_del_init(&rcio->wblist);
 	spin_unlock_irqrestore(&scbd->wb_lock, flags);
 
-	rcio->state = SC_RC_COMPLETE;
+	/*
+	 * Use SC_RC_LOG state here, then we could enter
+	 * sc_rc_interrupted
+	 */
+	rcio->state = SC_RC_LOG;
 	sc_rc_run_sm(rcio);
 }
 
@@ -322,7 +350,7 @@ static void sc_wb_queue(struct sc_rc_io *rcio)
 
 	list_add_tail(&rcio->wblist, &pos->wblist);
 	spin_unlock_irqrestore(&scbd->wb_lock, flags);
-	WRITE_ONCE(rcio->sci->wb_rcio, rcio);
+	WRITE_ONCE(rcio->sci->data, rcio);
 	if (queue)
 		queue_work(sc_workqueue, &scbd->wb_work);
 }
@@ -752,8 +780,12 @@ static void sc_cache_complete(struct sc_cache_info *sci)
 
 	old = READ_ONCE(sci->status);
 
-	if (SCI_STATE(old) == SCI_RECLAIMING ||
-		SCI_STATE(old) == SCI_READAHEAD) {
+	/*
+	 * During readahead, the log and IO will be submited in parallel
+	 * and complete ahead of changing state, so we could complete
+	 * under SCI_READAHEAD.
+	 */
+	if (SCI_STATE(old) == SCI_RECLAIMING) {
 		WARN(1, "Wrong sci state %s\n", sci_state_strings[SCI_STATE(old)]);
 		return;
 	}
@@ -951,40 +983,92 @@ static void sc_ra_write_cache(struct sc_ra_io *raio)
  */
 static void sc_ra_log_done(void *data)
 {
-	sc_ra_sm(data);
+	struct sc_ra_io *raio = data;
+
+	/*
+	 * All of the IO submited with log in parallel
+	 * have been completed.
+	 */
+	if (atomic_dec_return(&raio->ios) == 0)
+		sc_ra_sm(data);
+}
+
+static void sc_ra_io_endio(struct bio *clone)
+{
+	struct sc_io *sio = clone->bi_private;
+	struct sc_ra_io *raio = sio->sci->data;
+
+	if (atomic_dec_return(&raio->ios) == 0)
+		queue_work(sc_workqueue, &raio->async_work);
 }
 
 static void sc_ra_log(struct sc_ra_io *raio)
 {
+	struct sc_cache_info *sci = raio->sci;
 	struct sc_log_item *sli;
+	struct llist_node *first, *node, *next;
+	struct sc_io *sio;
 
+	first = llist_del_all(&sci->pending_list);
+	BUG_ON(!first);
+	llist_for_each_safe(node, next, first){
+		sio = container_of(node, struct sc_io, node);
+		if (op_is_write(bio_op(sio->front_bio)))
+			raio->write_pending = true;
+		atomic_inc(&raio->ios);
+	}
+
+	raio->io_list = first;
 	/*
 	 * TODO
 	 *  - mempool or kmem cache
 	 */
 	sli = kmalloc(sizeof(*sli), GFP_NOIO);
 	sli->sl = &raio->scbd->sb->log;
-	sli->op = SC_LOG_OP_MAP_SET;
+	sli->op = raio->write_pending ? SC_LOG_OP_MAP_DIRTY : SC_LOG_OP_MAP_SET;
 	sli->cb = raio->cb;
 	sli->bb = raio->bb;
 	sli->log_done = sc_ra_log_done;
 	sli->private = raio;
+	
+	atomic_inc(&raio->ios);
 
 	sc_log_insert(sli);
+
+	/*
+	 * send out the pending IOs with log.
+	 * thse IOs can only return to upper layer when log is completed.
+	 */
+	llist_for_each_safe(node, next, first){
+		sio = container_of(node, struct sc_io, node);
+		sc_cache_io(sio, sci, sc_ra_io_endio);
+	}
 }
+static void sc_ra_handle_ios(struct sc_ra_io *raio)
+{
+	struct llist_node *node, *next;
+	struct sc_io *sio;
+
+	llist_for_each_safe(node, next, raio->io_list){
+		sio = container_of(node, struct sc_io, node);
+		sc_writeback_endio(&sio->clone);
+	}
+	raio->io_list = NULL;
+}
+
 
 static void sc_ra_complete(struct sc_ra_io *raio)
 {
 	struct sc_cache_info *sci = raio->sci;
 	uint64_t data;
+	enum sci_state state;
 
+	sc_ra_handle_ios(raio);
 	sci->bb = raio->bb;
-	sci->cb = raio->cb;
+	state = raio->write_pending ? SCI_DIRTY : SCI_CLEAN;
 	sc_free_raio(raio);
-	/*
-	 * Setup a clean cache entry after readahead
-	 */
-	data = 	SCI(0, 0, SCI_CLEAN);
+
+	data = 	SCI(0, 0, state);
 	WRITE_ONCE(sci->status, data);
 	/*
 	 * sci_read_lock
@@ -998,6 +1082,12 @@ static void sc_ra_complete(struct sc_ra_io *raio)
 	 * see SCI_CLEAN.
 	 */
 	sci_sync(sci);
+	/*
+	 * The pending_list has been cleaned, so we
+	 * have to depend on this to prevent new IO
+	 * from triggering readahead again.
+	 */
+	WRITE_ONCE(sci->data, NULL);
 	sc_handle_pending_list(sci);
 }
 
@@ -1042,13 +1132,24 @@ static void sc_cache_readahead(struct sc_backing_dev *scbd,
 	struct sc_ra_io *raio;
 	int i;
 
+	/*
+	 * This says the previous pending IOs are issued with log
+	 * in parallel, so the pending_list is empty again.
+	 */
+	if (sci->data)
+		return;
+
 	raio = sc_alloc_raio(sb->block_size / PAGE_SIZE);
 	raio->scbd = scbd;
 	raio->sci = sci;
 	raio->bb = bb;
 	raio->cb = cb;
 	raio->state = SC_RA_READ_BACKING;
+	raio->io_list = NULL;
+	atomic_set(&raio->ios, 0);
+	raio->write_pending = false;
 	INIT_WORK(&raio->async_work, sc_ra_async_work);
+	sci->data = raio;
 	/*
 	 * Our max block size is 512K which needs 128 vecs
 	 * The max bio vecs is 256.
@@ -1158,9 +1259,12 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 	switch (sc_cache_start(sci, sio->started,
 				op_is_write(bio_op(bio)))) {
 	case SCI_CLEANING:
+		/*
+		 * Only for the case writeback and write IO in parallel.
+		 */
 		llist_add(&sio->node, &sci->pending_list);
 		sci_read_unlock(sci);
-		if (READ_ONCE(sci->wb_rcio))
+		if (READ_ONCE(sci->data))
 		    sc_interrupt_wb(scbd, sci);
 		break;
 	case SCI_READAHEAD:
@@ -1201,16 +1305,8 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 		 * cache hit
 		 */
 		sci_read_unlock(sci);
-		sio->started = true;
-		sio->sci = sci;
-		__bio_clone_fast(clone, bio);
-		clone->bi_iter.bi_sector = (cblock << sb->bitsbsz2sc) + (offset & sb->scblkmask);
 		trace_printk("cache hit IO ca %lx ba %lx\n", clone->bi_iter.bi_sector, offset);
-		bio_set_dev(clone, scbd->caching_dev);
-		clone->bi_end_io = sc_writeback_endio;
-		clone->bi_private = sio;
-
-		ret = submit_bio(clone);
+		ret = sc_cache_io(sio, sci, sc_writeback_endio);
 		break;
 	}
 
@@ -1470,6 +1566,13 @@ static unsigned long __sc_patch_mapping(struct sc_sb *sb, struct page **pages, i
 				break;
 			case SC_LOG_OP_NOP:
 				break;
+			case SC_LOG_OP_MAP_DIRTY:
+				/*
+				 * The following log entry contains the bblock
+				 */
+				start++;
+				e->data = SC_ENTRY_CONSTRUCT(start->data, 1, 1);
+				break;
 			default:
 				WARN_ON(1);
 				break;
@@ -1651,8 +1754,9 @@ repeat:
 		/*
 		 * MAP_SET need two entries.
 		 */
-		if (sli->op == SC_LOG_OP_MAP_SET &&
-			offset == (SC_LOG_ENTRIES_PER_PAGE - 1)) {
+		if ((sli->op == SC_LOG_OP_MAP_SET ||
+		     sli->op == SC_LOG_OP_MAP_DIRTY) &&
+		    (offset == (SC_LOG_ENTRIES_PER_PAGE - 1))) {
 			addr[offset] = SC_LOG_CONSTRUCT(sli->cb, sb->run_gen, SC_LOG_OP_NOP);
 			offset++;
 		}
@@ -1667,7 +1771,7 @@ repeat:
 		 */
 		addr[offset] = SC_LOG_CONSTRUCT(sli->cb, sb->run_gen, sli->op);
 		offset++; /* so the offset's unit is uint32_t */
-		if (sli->op == SC_LOG_OP_MAP_SET) {
+		if (sli->op == SC_LOG_OP_MAP_SET || sli->op == SC_LOG_OP_MAP_DIRTY) {
 			addr[offset] = sli->bb;
 			offset++;
 		}
@@ -1893,7 +1997,7 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 		sci->bb = ~0;
 		sci->atime = now;
 		sci->status = SCI(0, 0, SCI_READAHEAD);
-		sci->wb_rcio = NULL;
+		sci->data = NULL;
 		rwlock_init(&sci->rwlock);
 		init_llist_head(&sci->pending_list);
 	}
