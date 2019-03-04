@@ -40,6 +40,11 @@ enum sc_rc_action {
 	SC_RCA_RECLAIM,
 };
 
+enum sc_rc_clean_type {
+	SC_RCC_CLEANING,
+	SC_RCC_CLEANING_UNINTERRUPTIBLE,
+	SC_RCC_CLEAN,
+};
 enum sc_rc_state {
 	SC_RC_RD = 0,
 	SC_RC_WB,
@@ -82,6 +87,12 @@ struct sc_ra_io {
 	struct llist_node *io_list;
 	atomic_t ios;
 	bool write_pending;
+
+	/*
+	 * the sio written to caching directly needn't
+	 * to be submited again in sc_ra_log.
+	 */
+	struct sc_io *wcd_sio;
 };
 
 /*
@@ -97,21 +108,24 @@ struct sc_ra_io {
  * 1 		clean
  * 2 		dirty
  * 3 		cleaning
- * 4 		reclaiming
+ * 4        cleaning uninterruptible
+ * 5 		reclaiming
  *
  */
+
+#define SCI_FLAG_RA_START 0
 
 struct sc_cache_info {
 	struct {
 		uint32_t status;
 		unsigned long atime; /* last access time in jiffies */
 		unsigned short upper_hc;
-		unsigned short flags;
 		rwlock_t rwlock;
 	}  ____cacheline_aligned_in_smp;
 	int bb;
 	int cb;
 	struct llist_head pending_list; /* readahead, dirty log */
+	unsigned long flags;
 	/*
 	 * Employed by two cases:
 	 *  - interrupt the wb, it is a rcio
@@ -125,6 +139,7 @@ enum sci_state {
 	SCI_CLEAN,
 	SCI_DIRTY,
 	SCI_CLEANING,
+	SCI_CLEANING_UNINTERRUPTIBLE,
 	SCI_RECLAIMING,
 };
 

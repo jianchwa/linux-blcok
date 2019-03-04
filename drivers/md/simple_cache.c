@@ -41,6 +41,8 @@ static char *sci_state_strings[] = {
 	"READAHEAD",
 	"CLEAN",
 	"DIRTY",
+	"CLEANING",
+	"CLEANING_UNINTERRUTIBLE",
 	"RECLAIMING"
 };
 
@@ -68,9 +70,12 @@ static void sc_handle_pending_list(struct sc_cache_info *sci);
 static void sc_rc_sm(struct sc_rc_io *rcio);
 static void sc_block_free(struct sc_backing_dev *scbd, int block);
 static bool sc_cache_reclaim(struct sc_cache_info *sci, bool *dirty);
-static bool sc_cache_clean(struct sc_cache_info *sci, bool ing);
+static bool sc_cache_clean(struct sc_cache_info *sci, enum sc_rc_clean_type rcc);
 static void sc_cache_dirty(struct sc_cache_info *sci);
 static void sc_rc_run_sm(struct sc_rc_io *rcio);
+static void sc_free_rcio(struct sc_rc_io *rcio);
+static void sc_ra_run_sm(struct sc_ra_io *raio);
+static unsigned long sc_calc_start(uint64_t old, enum sci_state state);
 
 struct sc_multi_io {
 	atomic_t bios;
@@ -281,7 +286,7 @@ static void sc_wb_work(struct work_struct *work)
 
 	if (list_empty_careful(&scbd->wb_pending))
 		return;
-
+retry:
 	spin_lock_irqsave(&scbd->wb_lock, flags);
 	if (list_empty_careful(&scbd->wb_pending)) {
 		spin_unlock_irqrestore(&scbd->wb_lock, flags);
@@ -295,6 +300,9 @@ static void sc_wb_work(struct work_struct *work)
 	list_del_init(&rcio->wblist);
 	spin_unlock_irqrestore(&scbd->wb_lock, flags);
 
+	if (SCI_STATE(READ_ONCE(rcio->sci->status)) != SCI_CLEANING)
+		goto retry;
+
 	sc_rc_writeback(rcio);
 	return;
 }
@@ -303,11 +311,6 @@ static void sc_interrupt_wb(struct sc_backing_dev *scbd, struct sc_cache_info *s
 {
 	struct sc_rc_io *rcio = READ_ONCE(sci->data);
 	unsigned long flags;
-
-	if (!rcio)
-	    return;
-
-	WRITE_ONCE(sci->data, NULL);
 
 	/*
 	 * If the rcio is pending on WB list, we steal it
@@ -324,12 +327,7 @@ static void sc_interrupt_wb(struct sc_backing_dev *scbd, struct sc_cache_info *s
 	list_del_init(&rcio->wblist);
 	spin_unlock_irqrestore(&scbd->wb_lock, flags);
 
-	/*
-	 * Use SC_RC_LOG state here, then we could enter
-	 * sc_rc_interrupted
-	 */
-	rcio->state = SC_RC_LOG;
-	sc_rc_run_sm(rcio);
+	sc_free_rcio(rcio);
 }
 
 static void sc_wb_queue(struct sc_rc_io *rcio)
@@ -350,7 +348,6 @@ static void sc_wb_queue(struct sc_rc_io *rcio)
 
 	list_add_tail(&rcio->wblist, &pos->wblist);
 	spin_unlock_irqrestore(&scbd->wb_lock, flags);
-	WRITE_ONCE(rcio->sci->data, rcio);
 	if (queue)
 		queue_work(sc_workqueue, &scbd->wb_work);
 }
@@ -473,7 +470,8 @@ static void sc_free_rcio(struct sc_rc_io *rcio)
 
 static void sc_rc_complete(struct sc_rc_io *rcio)
 {
-	sc_cache_clean(rcio->sci, false);
+	rcio->sci->data = NULL;
+	sc_cache_clean(rcio->sci, SC_RCC_CLEAN);
 	sci_sync(rcio->sci);
 	sc_handle_pending_list(rcio->sci);
 #if 0
@@ -487,7 +485,6 @@ static void sc_rc_interrupted(struct sc_rc_io *rcio)
 {
 	switch (rcio->action) {
 	case SC_RCA_CLEAN:
-		sc_cache_dirty(rcio->sci);
 		break;
 	case SC_RCA_RECLAIM:
 		break;
@@ -496,8 +493,6 @@ static void sc_rc_interrupted(struct sc_rc_io *rcio)
 		break;
 	}
 
-	sci_sync(rcio->sci);
-	sc_handle_pending_list(rcio->sci);
 	sc_free_rcio(rcio);
 }
 
@@ -512,7 +507,7 @@ static void sc_rc_sm(struct sc_rc_io *rcio)
 	trace_printk("rc bb %lx cb %lx %s\n",
 			rcio->bb, rcio->cb, sc_rc_state_strings[rcio->state]);
 
-	if (!llist_empty(&rcio->sci->pending_list))
+	if (SCI_STATE(READ_ONCE(rcio->sci->status)) != SCI_CLEANING)
 		interrupt = true;
 
 	switch(rcio->state) {
@@ -544,7 +539,8 @@ static void sc_rc_sm(struct sc_rc_io *rcio)
 		 * dirty clean / mapping clean log
 		 * Interruptible
 		 */
-		if (interrupt)
+		if (interrupt ||
+		    !sc_cache_clean(rcio->sci, SC_RCC_CLEANING_UNINTERRUPTIBLE))
 			goto intr;
 		sc_rc_log(rcio);
 		break;
@@ -603,6 +599,7 @@ static void sc_reclaim_one(struct sc_backing_dev *scbd,
 		rcio->state = SC_RC_LOG;
 	}
 
+	sci->data = rcio;
 	atomic_inc(&scbd->rcio_running);
 	sc_rc_run_sm(rcio);
 }
@@ -650,7 +647,7 @@ static void sc_reclaim(struct sc_backing_dev *scbd)
 		case SC_RCA_NOP:
 			break;
 		case SC_RCA_CLEAN:
-			if (sc_cache_clean(sci, true))
+			if (sc_cache_clean(sci, SC_RCC_CLEANING))
 				sc_reclaim_one(scbd, sci, SC_RCA_CLEAN);
 			break;
 		case SC_RCA_RECLAIM:
@@ -689,7 +686,7 @@ static void sc_writeback_endio(struct bio *clone)
 	free_sc_io(sio);
 }
 
-static unsigned long sc_calc_clean(uint64_t old, bool ing)
+static unsigned long sc_calc_clean(uint32_t old, enum sc_rc_clean_type rcc)
 {
 	int hit, inflight;
 	enum sci_state state;
@@ -698,33 +695,56 @@ static unsigned long sc_calc_clean(uint64_t old, bool ing)
 	 * Inflight must be 0 for CLEANING
 	 */
 	hit = SCI_HIT_COUNT(old);
-	if (ing) {
+	inflight = SCI_INFLIGHT(old);
+	switch (rcc) {
+	case SC_RCC_CLEANING:
 		state = SCI_CLEANING;
 		inflight = 0;
-	} else {
+		break;
+	case SC_RCC_CLEANING_UNINTERRUPTIBLE:
+		state = SCI_CLEANING_UNINTERRUPTIBLE;
 		/*
 		 * There could be read IO inflight with CLEANING in parallel.
 		 */
-		inflight = SCI_INFLIGHT(old);
+		break;
+	case SC_RCC_CLEAN:
 		state = SCI_CLEAN;
+		break;
+	default:
+		WARN_ON(1);
+		return false;
 	}
+
 	return SCI(hit, inflight, state);
 }
 
-static bool sc_cache_clean(struct sc_cache_info *sci, bool ing)
+static bool sc_cache_clean(struct sc_cache_info *sci, enum sc_rc_clean_type rcc)
 {
 	uint32_t new, old, res;
+	enum sci_state state;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
-		if (SCI_INFLIGHT(old)) {
-			trace_printk("cb %x if %x\n",
-					sci->cb,
-					SCI_INFLIGHT(old));
-			return false;
+		state = SCI_STATE(old);
+		switch (rcc) {
+		case SC_RCC_CLEANING:
+			if ((state != SCI_DIRTY) || SCI_INFLIGHT(old))
+				return false;
+			break;
+		/*
+		 * There could be read IO in-flight after CLEANING
+		 */
+		case SC_RCC_CLEANING_UNINTERRUPTIBLE:
+			if (state != SCI_CLEANING)
+				return false;
+			break;
+		case SC_RCC_CLEAN:
+			WARN_ON(state != SCI_CLEANING_UNINTERRUPTIBLE);
+			break;
+		default:
+			break;
 		}
-
-		new = sc_calc_clean(old, ing);
+		new = sc_calc_clean(old, rcc);
 		res = cmpxchg(&sci->status, old, new);
 		if (old == res)
 			break;
@@ -830,13 +850,11 @@ static void sc_cache_dirty(struct sc_cache_info *sci)
 	}
 }
 
-static unsigned long sc_calc_start(uint64_t old)
+static unsigned long sc_calc_start(uint64_t old, enum sci_state state)
 {
 	int hit, inflight;
-	enum sci_state state;
 
 	inflight = SCI_INFLIGHT(old);
-	state = SCI_STATE(old);
 	hit = SCI_HIT_COUNT(old);
 	inflight++;
 	hit++;
@@ -844,9 +862,12 @@ static unsigned long sc_calc_start(uint64_t old)
 	return SCI(hit, inflight, state);
 }
 
-static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started, bool w)
+static enum sci_state sc_cache_start(struct sc_backing_dev *scbd,
+		struct sc_cache_info *sci, bool started, bool w)
 {
 	uint32_t old, new, res;
+	enum sci_state state;
+	bool interrupt;
 
 	old = READ_ONCE(sci->status);
 	while (1) {
@@ -855,19 +876,6 @@ static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started, bo
 				SCI_INFLIGHT(old),
 				sci_state_strings[SCI_STATE(old)],
 				started);
-
-		/*
-		 * Write cannot be ongoing with write IO
-		 */
-		if (unlikely(SCI_STATE(old) == SCI_CLEANING && w))
-			return SCI_CLEANING;
-
-		/*
-		 * cblock under SCI_READAHEAD will not be reclaimed.
-		 */
-		if (SCI_STATE(old) == SCI_READAHEAD)
-			return SCI_READAHEAD;
-
 		/*
 		 * sios will re-enter sc_writeback after dirty log, they have been
 		 * accounted as sci in-flight, so needn't account them again.
@@ -875,7 +883,33 @@ static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started, bo
 		if (started)
 			return SCI_STATE(old);
 
-		new = sc_calc_start(old);
+		interrupt = false;
+		state = SCI_STATE(old);
+		switch(state) {
+		/*
+		 * cblock under SCI_READAHEAD will not be reclaimed.
+		 */
+		case SCI_READAHEAD:
+			return state;
+		case SCI_CLEANING:
+			if (w) {
+				state = SCI_DIRTY;
+				interrupt = true;
+			}
+			break;
+		/*
+		 * When the set clean log is ongoing, write IO couldn't
+		 * interrupt the wb any more.
+		 */
+		case SCI_CLEANING_UNINTERRUPTIBLE:
+			if (w)
+				return state;
+			/* fallthrougth */
+		default:
+			break;
+		}
+
+		new = sc_calc_start(old, state);
 		/*
 		 * May race with reclaim or concurrent submits and completions.
 		 */
@@ -890,6 +924,8 @@ static enum sci_state sc_cache_start(struct sc_cache_info *sci, bool started, bo
 			sci->atime = jiffies;
 			if (SCI_HIT_COUNT(new) == 0)
 				sci->upper_hc++;
+			if (interrupt)
+				sc_interrupt_wb(scbd, sci);
 			return SCI_STATE(old);
 		}
 		old = res;
@@ -920,7 +956,10 @@ static struct sc_ra_io *sc_alloc_raio(int nr)
 	 * FIXME
 	 *   We should consider the failing case.
 	 */
-	raio = kmalloc(sizeof(*raio), GFP_NOIO);
+	raio = kzalloc(sizeof(*raio), GFP_NOIO);
+	if (!nr)
+		return raio;
+
 	raio->pages = kmalloc(sizeof(void *) * nr, GFP_NOIO);
 	for (i = 0; i < nr; i++) {
 		raio->pages[i] = alloc_page(GFP_NOIO);
@@ -951,7 +990,7 @@ static void sc_ra_endio(struct bio *bio)
 {
 	struct sc_ra_io *raio = bio->bi_private;
 
-	queue_work(sc_workqueue, &raio->async_work);
+	sc_ra_run_sm(raio);
 }
 
 static void sc_ra_write_cache(struct sc_ra_io *raio)
@@ -990,7 +1029,7 @@ static void sc_ra_log_done(void *data)
 	 * have been completed.
 	 */
 	if (atomic_dec_return(&raio->ios) == 0)
-		sc_ra_sm(data);
+		sc_ra_run_sm(raio);
 }
 
 static void sc_ra_io_endio(struct bio *clone)
@@ -999,7 +1038,26 @@ static void sc_ra_io_endio(struct bio *clone)
 	struct sc_ra_io *raio = sio->sci->data;
 
 	if (atomic_dec_return(&raio->ios) == 0)
-		queue_work(sc_workqueue, &raio->async_work);
+		sc_ra_run_sm(raio);
+}
+
+static void sc_ra_cache_start(struct sc_cache_info *sci)
+{
+	uint32_t old, new, res;
+
+	old = READ_ONCE(sci->status);
+
+	while (1) {
+		new = sc_calc_start(old, SCI_READAHEAD);
+		res = cmpxchg(&sci->status, old, new);
+		if (old == res) {
+			sci->atime = jiffies;
+			if (SCI_HIT_COUNT(new) == 0)
+				sci->upper_hc++;
+			break;
+		}
+		old = res;
+	}
 }
 
 static void sc_ra_log(struct sc_ra_io *raio)
@@ -1010,7 +1068,10 @@ static void sc_ra_log(struct sc_ra_io *raio)
 	struct sc_io *sio;
 
 	first = llist_del_all(&sci->pending_list);
-	BUG_ON(!first);
+	/*
+	 * Note, the first could be NULL due to read IO
+	 * would not be blocked by readahead.
+	 */
 	llist_for_each_safe(node, next, first){
 		sio = container_of(node, struct sc_io, node);
 		if (op_is_write(bio_op(sio->front_bio)))
@@ -1041,6 +1102,12 @@ static void sc_ra_log(struct sc_ra_io *raio)
 	 */
 	llist_for_each_safe(node, next, first){
 		sio = container_of(node, struct sc_io, node);
+		if (sio == raio->wcd_sio)
+			continue;
+		/*
+		 * Touch the sci to balance with the sc_writeback_endio in sc_ra_handle_ios.
+		 */
+		sc_ra_cache_start(sci);
 		sc_cache_io(sio, sci, sc_ra_io_endio);
 	}
 }
@@ -1064,7 +1131,6 @@ static void sc_ra_complete(struct sc_ra_io *raio)
 	enum sci_state state;
 
 	sc_ra_handle_ios(raio);
-	sci->bb = raio->bb;
 	state = raio->write_pending ? SCI_DIRTY : SCI_CLEAN;
 	sc_free_raio(raio);
 
@@ -1074,19 +1140,24 @@ static void sc_ra_complete(struct sc_ra_io *raio)
 	 * sci_read_lock
 	 * get SCI_READAHEAD
 	 * add to pending_list    set SCI_CLEAN
+	 * test and set SCI_FLAG_RA_START
 	 * sci_read_unlock
 	 *                        sci_sync
-	 * Therefore,
-	 * sc_ra_complete could see all of the sci
-	 * added on pending_list if someone doesn't
-	 * see SCI_CLEAN.
+	 *                        clear SCI_FLAG_RA_START
+	 *                        handle pending_list
+	 * After sci_sync
+	 * - sc_ra_complete could see all of the sci
+	 *   added on pending_list if someone doesn't
+	 *   see SCI_CLEAN. Then we won't leak any pending
+	 *   sio.
+	 * - The tasks before sci_sync must see
+	 *   SCI_FLAG_RA_START is set and do nothing.
+	 *   The tasks after sci_sync must see SCI_CLEAN
+	 *   and won't touch sci->flags anymore. Then we
+	 *   won't trigger readahead twice.
 	 */
 	sci_sync(sci);
-	/*
-	 * The pending_list has been cleaned, so we
-	 * have to depend on this to prevent new IO
-	 * from triggering readahead again.
-	 */
+	clear_bit(SCI_FLAG_RA_START, &sci->flags);
 	WRITE_ONCE(sci->data, NULL);
 	sc_handle_pending_list(sci);
 }
@@ -1114,6 +1185,29 @@ static void sc_ra_sm(struct sc_ra_io *raio)
 	}
 }
 
+static void sc_ra_run_sm(struct sc_ra_io *raio)
+{
+	switch (raio->state) {
+	/*
+	 * Both of READ_BACKING and WRITE_CACHING are
+	 * in irq context, so run them in kworker context.
+	 */
+	case SC_RA_READ_BACKING:
+	case SC_RA_WRITE_CACHING:
+	/*
+	 * Due to the disordering of ra log and IOs to cache,
+	 * we could be in either log insert_work context or caching
+	 * device IO irq completion. So defer it to kworker context.
+	 */
+	case SC_RA_LOG:
+		queue_work(sc_workqueue, &raio->async_work);
+		break;
+	default:
+		WARN_ON(1);
+		break;
+	}
+}
+
 /*
  * Used for irq completion path
  */
@@ -1124,32 +1218,12 @@ static void sc_ra_async_work(struct work_struct *work)
 	sc_ra_sm(raio);
 }
 
-static void sc_cache_readahead(struct sc_backing_dev *scbd,
-		struct sc_cache_info *sci, unsigned long cb, unsigned long bb)
+static void __sc_cache_readahead(struct sc_backing_dev *scbd, struct sc_ra_io *raio)
 {
-	struct sc_sb *sb = scbd->sb;
 	struct bio *bio;
-	struct sc_ra_io *raio;
 	int i;
 
-	/*
-	 * This says the previous pending IOs are issued with log
-	 * in parallel, so the pending_list is empty again.
-	 */
-	if (sci->data)
-		return;
-
-	raio = sc_alloc_raio(sb->block_size / PAGE_SIZE);
-	raio->scbd = scbd;
-	raio->sci = sci;
-	raio->bb = bb;
-	raio->cb = cb;
-	raio->state = SC_RA_READ_BACKING;
-	raio->io_list = NULL;
-	atomic_set(&raio->ios, 0);
-	raio->write_pending = false;
-	INIT_WORK(&raio->async_work, sc_ra_async_work);
-	sci->data = raio;
+	BUG_ON(!raio->nr);
 	/*
 	 * Our max block size is 512K which needs 128 vecs
 	 * The max bio vecs is 256.
@@ -1157,7 +1231,7 @@ static void sc_cache_readahead(struct sc_backing_dev *scbd,
 	 * - we need a mempool of ourself 
 	 */
 	bio = bio_alloc(GFP_NOIO, raio->nr);
-	bio->bi_iter.bi_sector = bb << sb->bitsbsz2sc;
+	bio->bi_iter.bi_sector = raio->bb << scbd->sb->bitsbsz2sc;
 	bio_set_dev(bio, scbd->backing_dev);
 	bio_set_op_attrs(bio, REQ_OP_READ, 0);
 	for (i = 0; i < raio->nr; i++)
@@ -1167,6 +1241,77 @@ static void sc_cache_readahead(struct sc_backing_dev *scbd,
 	raio->bio = bio;
 
 	submit_bio(bio);
+}
+
+void sc_ra_wcd_endio(struct bio *clone)
+{
+	struct sc_ra_io *raio = clone->bi_private;
+
+	bio_put(clone);
+	raio->state = SC_RA_WRITE_CACHING;
+	sc_ra_run_sm(raio);
+}
+
+static void sc_ra_wcd(struct sc_backing_dev *scbd,
+		struct sc_ra_io *raio, struct sc_io *sio)
+{
+	struct sc_sb *sb = scbd->sb;
+	struct bio *clone;
+
+	clone = bio_alloc(GFP_NOIO, 0);
+	__bio_clone_fast(clone, sio->front_bio);
+	clone->bi_iter.bi_sector = raio->cb << sb->bitsbsz2sc;
+	bio_set_dev(clone, scbd->caching_dev);
+	clone->bi_end_io = sc_ra_wcd_endio;
+	clone->bi_private = raio;
+	raio->wcd_sio = sio;
+
+	submit_bio(clone);
+}
+
+static void sc_cache_readahead(struct sc_backing_dev *scbd,
+		struct sc_cache_info *sci, struct sc_io *sio)
+{
+	struct sc_sb *sb = scbd->sb;
+	struct sc_ra_io *raio;
+	struct bio *bio;
+	int nr;
+
+	/*
+	 * This says the previous pending IOs are issued with log
+	 * in parallel, so the pending_list is empty again.
+	 */
+	if (sci->data)
+		return;
+
+	bio = sio->front_bio;
+	/*
+	 * The write IO could cover the whole cb, then we just
+	 * need to write it to caching device directly and needn't
+	 * read from backing device.
+	 */
+	if (bio_op(bio) ==  REQ_OP_WRITE &&
+	    bio_sectors(bio) == sb->block_size)
+		nr = 0;
+	else
+		nr = sb->block_size / PAGE_SIZE;
+
+	raio = sc_alloc_raio(nr);
+	raio->scbd = scbd;
+	raio->sci = sci;
+	raio->bb = sci->bb;
+	raio->cb = sci->cb;
+	raio->state = SC_RA_READ_BACKING;
+	raio->io_list = NULL;
+	atomic_set(&raio->ios, 0);
+	raio->write_pending = false;
+	INIT_WORK(&raio->async_work, sc_ra_async_work);
+	sci->data = raio;
+
+	if (nr)
+		__sc_cache_readahead(scbd, raio);
+	else
+		sc_ra_wcd(scbd, raio, sio);
 
 	return;
 }
@@ -1215,6 +1360,7 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 	struct bio *bio = sio->front_bio;
 	struct bio *clone = &sio->clone;
 	sector_t offset = bio->bi_iter.bi_sector;
+	bool w = op_is_write(bio_op(bio));
 	bool first;
 
 	/*
@@ -1256,31 +1402,33 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 	}
 
 	sci_read_lock(sci);
-	switch (sc_cache_start(sci, sio->started,
-				op_is_write(bio_op(bio)))) {
-	case SCI_CLEANING:
-		/*
-		 * Only for the case writeback and write IO in parallel.
-		 */
+	switch (sc_cache_start(scbd, sci, sio->started, w)) {
+	case SCI_CLEANING_UNINTERRUPTIBLE:
 		llist_add(&sio->node, &sci->pending_list);
 		sci_read_unlock(sci);
-		if (READ_ONCE(sci->data))
-		    sc_interrupt_wb(scbd, sci);
 		break;
 	case SCI_READAHEAD:
 		/*
 		 * trigger readahead
-		 * the other IOs on the same block should wait for the readahead,
+		 * all the write IOs on this block should wait for the readahead,
 		 * otherwise, the readahead block maybe different from the one on
 		 * backing device.
+		 * read IOs needn't wait for the readahead complete as block layer
+		 * doesn't keep the order of incomming IOs.
 		 */
-		first = llist_add(&sio->node, &sci->pending_list);
+		if (w)
+			llist_add(&sio->node, &sci->pending_list);
+		first = !test_and_set_bit(SCI_FLAG_RA_START, &sci->flags);
 		/*
 		 * See comments in sc_ra_complete
 		 */
 		sci_read_unlock(sci);
-		if (first)
-			sc_cache_readahead(scbd, sci, cblock, offset >> sb->bitsbsz2sc);
+		if (first) {
+			sci->bb = offset >> sb->bitsbsz2sc;
+			sc_cache_readahead(scbd, sci, sio);
+		}
+		if (!w)
+			goto passthrough;
 		break;
 	case SCI_CLEAN:
 		/*
@@ -1305,8 +1453,8 @@ static blk_qc_t sc_writeback(struct sc_io *sio)
 		 * cache hit
 		 */
 		sci_read_unlock(sci);
-		trace_printk("cache hit IO ca %lx ba %lx\n", clone->bi_iter.bi_sector, offset);
 		ret = sc_cache_io(sio, sci, sc_writeback_endio);
+		trace_printk("cache hit IO ca %lx ba %lx\n", clone->bi_iter.bi_sector, offset);
 		break;
 	}
 
@@ -1996,7 +2144,9 @@ static int sc_blocks_allocator_init(struct sc_backing_dev *scbd)
 		sci->cb = i + scbd->cb_offset;
 		sci->bb = ~0;
 		sci->atime = now;
+		sci->upper_hc = 0;
 		sci->status = SCI(0, 0, SCI_READAHEAD);
+		sci->flags = 0;
 		sci->data = NULL;
 		rwlock_init(&sci->rwlock);
 		init_llist_head(&sci->pending_list);
@@ -2785,13 +2935,16 @@ static ssize_t sc_bd_map_show(struct sc_backing_dev *scbd, char *buf)
 	unsigned long i = scbd->cb_offset;
 	struct sc_cache_info *sci;
 
+	/*
+	 * We could access this interface after the cache is stopped.
+	 */
 	printk("SC: dump valid mapping entries at jiffies %ld\n", jiffies);
 	for (; i < scbd->scis_total; i++) {
 		sci = sc_get_cache_info(scbd, i);
 		if (SCI_STATE(sci->status))
-			printk("[%x -> %x]: ac %d at %ld if %d s %s\n",
+			printk("[%x -> %x]: ac %u at %lu if %d s %s\n",
 				sci->cb, sci->bb,
-				SCI_HIT_COUNT(sci->status),
+				SCI_HIT_COUNT(sci->status) + (sci->upper_hc * 1024),
 				sci->atime,
 				SCI_INFLIGHT(sci->status),
 				sci_state_strings[SCI_STATE(sci->status)]);
